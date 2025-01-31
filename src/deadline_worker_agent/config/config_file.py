@@ -113,6 +113,20 @@ To prevent the worker agent from shutting down the host when being told to stop,
 line below:
 """.lstrip(),
     )
+    SESSION_ROOT_DIR = ModifiableSettingData(
+        setting_name="session_root_dir",
+        table_name="worker",
+        preceding_comment="""
+The session root directory is a parent directory where worker agent creates per-session
+subdirectories under. This value is overridden when the DEADLINE_WORKER_SESSION_ROOT_DIR environment
+variable is set or the --session-root-dir command-line argument is specified.
+
+The default session root directory on POSIX systems is "/sessions" and on Windows systems is
+"C:\ProgramData\Amazon\OpenJD".
+
+Uncomment the line below and replace the value with your desired session root directory:
+""".lstrip(),
+    )
     WINDOWS_JOB_USER = ModifiableSettingData(
         setting_name="windows_job_user",
         table_name="os",
@@ -149,6 +163,7 @@ class WorkerConfigSection(BaseModel):
     fleet_id: Optional[str] = Field(regex=r"^fleet-[a-z0-9]{32}$", default=None)
     cleanup_session_user_processes: bool = True
     worker_persistence_dir: Optional[Path] = None
+    session_root_dir: Optional[Path] = None
 
 
 class AwsConfigSection(BaseModel):
@@ -394,6 +409,8 @@ class ConfigFile(BaseModel):
             output_settings["fleet_id"] = self.worker.fleet_id
         if self.worker.worker_persistence_dir is not None:
             output_settings["worker_persistence_dir"] = self.worker.worker_persistence_dir
+        if self.worker.session_root_dir is not None:
+            output_settings["session_root_dir"] = self.worker.session_root_dir
         if self.aws.profile is not None:
             output_settings["profile"] = self.aws.profile
         if self.aws.allow_ec2_instance_profile is not None:
