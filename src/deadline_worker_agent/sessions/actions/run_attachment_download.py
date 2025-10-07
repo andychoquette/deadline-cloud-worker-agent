@@ -6,6 +6,8 @@ from concurrent.futures import (
 )
 import os
 import sys
+import json
+
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from logging import LoggerAdapter
 from typing import Any, TYPE_CHECKING, Optional
@@ -49,6 +51,7 @@ from openjd.model import ParameterValue
 
 from ...log_messages import SessionActionLogKind
 from .openjd_action import OpenjdAction
+from ..attachment_models import WorkerManifestProperties
 
 if TYPE_CHECKING:
     from ..session import Session
@@ -89,24 +92,45 @@ class AttachmentDownloadAction(OpenjdAction):
         self._step_details = step_details
         self._logger = LoggerAdapter(OPENJD_LOG, extra={"session_id": session_id})
 
-    def set_step_script(self, manifests: list[str], s3_settings: JobAttachmentS3Settings) -> None:
+    def set_step_script(
+        self,
+        worker_manifest_properties_list: list[WorkerManifestProperties],
+        s3_settings: JobAttachmentS3Settings,
+    ) -> None:
         """Sets the step script for the action
 
         Parameters
         ----------
-        manifests : list[str]
-            The job attachment manifest paths
+        worker_manifest_properties_list : list[WorkerManifestProperties]
+            The worker manifest properties list containing manifest data
         s3_settings : JobAttachmentS3Settings
             The job attachment S3 settings
         """
+        # Create embedded files for each manifest and collect temporary paths
+        embedded_files = []
+
+        # Create embedded file for worker manifest properties
+        worker_props_data = []
+        for worker_props in worker_manifest_properties_list:
+            worker_props_data.append(worker_props.to_dict())
+
+        worker_props_json = json.dumps(worker_props_data, indent=2)
+        embedded_files.append(
+            EmbeddedFileText_2023_09(
+                name="WorkerManifestProperties",
+                type=EmbeddedFileTypes_2023_09.TEXT,
+                data=DataString(worker_props_json),
+            )
+        )
+
+        # Build the command arguments
+        download_script_path = Path(__file__).parent / "scripts" / "attachment_download.py"
         args = [
-            ArgString("{{ Task.File.AttachmentDownload }}"),
-            ArgString("-pm"),
-            ArgString("{{ Session.PathMappingRulesFile }}"),
+            ArgString(str(download_script_path)),
             ArgString("-s3"),
             ArgString(s3_settings.to_s3_root_uri()),
-            ArgString("-m"),
-            *[ArgString(manifest) for manifest in manifests],
+            ArgString("-wp"),
+            ArgString("{{ Task.File.WorkerManifestProperties }}"),
         ]
 
         executable_path = Path(sys.executable)
@@ -114,22 +138,15 @@ class AttachmentDownloadAction(OpenjdAction):
             "pythonservice.exe", "python.exe"
         )
 
-        with open(Path(__file__).parent / "scripts" / "attachment_download.py", "r") as f:
-            self._step_script = StepScript_2023_09(
-                actions=StepActions_2023_09(
-                    onRun=Action_2023_09(
-                        command=CommandString(str(python_path)),
-                        args=args,
-                    )
-                ),
-                embeddedFiles=[
-                    EmbeddedFileText_2023_09(
-                        name="AttachmentDownload",
-                        type=EmbeddedFileTypes_2023_09.TEXT,
-                        data=DataString(f.read()),
-                    )
-                ],
-            )
+        self._step_script = StepScript_2023_09(
+            actions=StepActions_2023_09(
+                onRun=Action_2023_09(
+                    command=CommandString(str(python_path)),
+                    args=args,
+                )
+            ),
+            embeddedFiles=embedded_files,
+        )
 
     def __eq__(self, other: Any) -> bool:
         return (
@@ -305,6 +322,35 @@ class AttachmentDownloadAction(OpenjdAction):
         for root_name, root_path in manifest_paths_by_root.items():
             session.add_manifest_path(root=root_name, path=root_path)
 
+        # Create WorkerManifestProperties list for enhanced worker agent processing
+        # Populate the manifest properties data from sync job input step
+        # The data is avavilable for subsequent actions such as sync step step
+        if not step_dependencies:
+            for manifest_properties in manifest_properties_list:
+                local_root_path: str = session._asset_sync.get_local_destination(
+                    manifest_properties=manifest_properties,
+                    dynamic_mapping_rules=dynamic_mapping_rules,
+                    storage_profiles_path_mapping_rules=storage_profiles_path_mapping_rules_dict,
+                )
+
+                # Create worker manifest property and add to session
+                worker_manifest_props = WorkerManifestProperties(
+                    manifest_properties=manifest_properties,
+                    local_root_path=local_root_path,
+                )
+                session.set_worker_manifest_properties(worker_manifest_props)
+
+        # Prepare input manifest for download task run
+        download_manifest_properties_list: list[WorkerManifestProperties] = list()
+        for local_root_path, manifest_path in manifest_paths_by_root.items():
+            download_manifest = session.add_local_manifest_path(
+                local_root_path=local_root_path, manifest_path=manifest_path
+            )
+            # Set the input file path for download
+            download_manifest.local_input_manifest_path = manifest_path
+            # Add to list for passing to step scripts
+            download_manifest_properties_list.append(download_manifest)
+
         #  Try to launch VFS if needed once all files are prepared
         if self._start_vfs(
             session=session,
@@ -329,13 +375,16 @@ class AttachmentDownloadAction(OpenjdAction):
             )
         else:
             self.set_step_script(
-                manifests=manifest_paths_by_root.values(),  # type: ignore
                 s3_settings=s3_settings,
+                worker_manifest_properties_list=download_manifest_properties_list,
             )
             assert self._step_script is not None
             session.run_task(
                 step_script=self._step_script,
                 task_parameter_values=dict[str, ParameterValue](),
+                os_env_vars={
+                    "DEADLINE_QUEUE_ID": session._queue_id,
+                },
                 log_task_banner=False,
             )
 
