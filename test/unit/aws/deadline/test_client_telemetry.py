@@ -3,6 +3,7 @@
 
 from unittest.mock import patch, MagicMock
 import pytest
+from dataclasses import asdict
 
 import deadline_worker_agent.aws.deadline as deadline_mod
 from deadline_worker_agent.aws.deadline import (
@@ -11,6 +12,7 @@ from deadline_worker_agent.aws.deadline import (
     record_sync_inputs_telemetry_event,
     record_sync_outputs_telemetry_event,
     record_uncaught_exception_telemetry_event,
+    _get_deadline_telemetry_client,
 )
 from deadline_worker_agent.capabilities import Capabilities
 from deadline.job_attachments.progress_tracker import SummaryStatistics
@@ -142,22 +144,22 @@ def test_record_attachment_upload_telemetry_event():
         # GIVEN
         summary_stats1 = SummaryStatistics(
             total_time=5,
-            total_files=3,
-            total_bytes=300,
+            total_files=4,
+            total_bytes=400,
             processed_files=3,
             processed_bytes=300,
-            skipped_files=0,
-            skipped_bytes=0,
+            skipped_files=1,
+            skipped_bytes=100,
             transfer_rate=60,
         )
         summary_stats2 = SummaryStatistics(
             total_time=3,
-            total_files=2,
-            total_bytes=200,
+            total_files=3,
+            total_bytes=300,
             processed_files=2,
             processed_bytes=200,
-            skipped_files=0,
-            skipped_bytes=0,
+            skipped_files=1,
+            skipped_bytes=100,
             transfer_rate=66.67,
         )
         upload_summaries = [summary_stats1, summary_stats2]
@@ -172,12 +174,12 @@ def test_record_attachment_upload_telemetry_event():
     # Verify the aggregated summary is calculated correctly
     expected_aggregate = {
         "total_time": 8.0,  # 5 + 3
-        "total_files": 5,  # 3 + 2
-        "total_bytes": 500,  # 300 + 200
+        "total_files": 7,  # 4 + 3
+        "total_bytes": 700,  # 400 + 300
         "processed_files": 5,  # 3 + 2
         "processed_bytes": 500,  # 300 + 200
-        "skipped_files": 0,  # 0 + 0
-        "skipped_bytes": 0,  # 0 + 0
+        "skipped_files": 2,  # 1 + 1
+        "skipped_bytes": 200,  # 100 + 100
         "transfer_rate": 62.5,  # 500 / 8
     }
 
@@ -186,28 +188,7 @@ def test_record_attachment_upload_telemetry_event():
         event_details={
             "queue_id": "queue-test",
             "upload_summary": expected_aggregate,
-            "upload_summaries": [
-                {
-                    "total_time": 5,
-                    "total_files": 3,
-                    "total_bytes": 300,
-                    "processed_files": 3,
-                    "processed_bytes": 300,
-                    "skipped_files": 0,
-                    "skipped_bytes": 0,
-                    "transfer_rate": 60.0,
-                },
-                {
-                    "total_time": 3,
-                    "total_files": 2,
-                    "total_bytes": 200,
-                    "processed_files": 2,
-                    "processed_bytes": 200,
-                    "skipped_files": 0,
-                    "skipped_bytes": 0,
-                    "transfer_rate": 66.67,
-                },
-            ],
+            "upload_summaries": [asdict(summary_stats1), asdict(summary_stats2)],
         },
     )
 
@@ -280,4 +261,28 @@ def test_record_decorator_fails():
             event_details={
                 "is_success": False,
             },
+        )
+
+
+def test_get_deadline_telemetry_client_sets_service_name():
+    """
+    Tests that _get_deadline_telemetry_client() creates a TelemetryClient with the correct
+    service name by directly constructing the client.
+    """
+    # Clear the cache to ensure fresh initialization
+    _get_deadline_telemetry_client.cache_clear()
+
+    mock_telemetry_client = MagicMock()
+
+    with patch("deadline_worker_agent.aws.deadline.TelemetryClient") as mock_telemetry_constructor:
+        mock_telemetry_constructor.return_value = mock_telemetry_client
+
+        # WHEN
+        client = _get_deadline_telemetry_client()
+
+        # THEN
+        assert client is mock_telemetry_client
+        mock_telemetry_constructor.assert_called_once_with(
+            package_name="deadline-cloud-worker-agent",
+            package_ver=".".join(deadline_mod.version.split(".")[:3]),
         )
