@@ -293,7 +293,7 @@ def submit_custom_job(
                                 if os.environ["OPERATING_SYSTEM"] == "linux"
                                 else {
                                     "command": "powershell",
-                                    "args": ["{{ Task.File.runScript }}"],
+                                    "args": ["{{ Task.File.runScript }}"],  # type: ignore[dict-item]
                                 }
                             ),
                         },
