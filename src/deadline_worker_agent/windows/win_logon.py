@@ -23,6 +23,7 @@ import secrets
 import string
 
 from .win_session import is_windows_session_zero
+from .win_user import is_domain_user
 
 if TYPE_CHECKING:
     from _win32typing import PyHKEY, PyHANDLE
@@ -77,22 +78,34 @@ def get_windows_credentials(username: str, password: str) -> _WindowsCredentials
         )
     try:
         # https://timgolden.me.uk/pywin32-docs/win32profile__LoadUserProfile_meth.html
+        # Parse domain from username for LogonUser
+        logon_domain = None
+        logon_username = username
+        if "\\" in username:
+            logon_domain, logon_username = username.split("\\", 1)
+        # For UPN (user@domain) and local users, domain stays None
+
         logon_token = LogonUser(
-            Username=username,
+            Username=logon_username,
             LogonType=LOGON32_LOGON_INTERACTIVE,
             LogonProvider=LOGON32_PROVIDER_DEFAULT,
             Password=password,
-            Domain=None,
+            Domain=logon_domain,
         )
     except OSError as e:
         raise BadCredentialsException(f'Error logging on as "{username}": {e}')
     else:
         # https://timgolden.me.uk/pywin32-docs/win32profile__LoadUserProfile_meth.html
+        # lpUserName is used as the base name of the profile directory.
+        # UPN format (user@domain) is not valid as a folder name — use bare username.
+        profile_username = username
+        if "@" in username:
+            profile_username = username.split("@")[0]
         # raises: OSError
         user_profile = LoadUserProfile(
             logon_token,
             {
-                "UserName": username,
+                "UserName": profile_username,
                 "Flags": PI_NOUI,
                 "ProfilePath": None,
             },
@@ -122,6 +135,11 @@ def reset_user_password(username: str) -> _WindowsCredentialsCacheEntry:
     Raises:
         PasswordResetException: If the password reset and logon was not successful.
     """
+    if is_domain_user(username):
+        raise PasswordResetException(
+            f'Password reset is not supported for domain user "{username}". '
+            "Domain user passwords must be managed externally."
+        )
     try:
         user_info = win32net.NetUserGetInfo(None, username, 1)
         user_info["password"] = generate_password(username)
