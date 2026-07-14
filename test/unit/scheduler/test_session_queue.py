@@ -43,6 +43,7 @@ from deadline_worker_agent.sessions.actions import (
 from deadline_worker_agent.sessions.errors import (
     EnvironmentDetailsError,
     JobEntityUnsupportedSchemaError,
+    SessionActionError,
     StepDetailsError,
 )
 from deadline_worker_agent.sessions.job_entities import (
@@ -302,7 +303,7 @@ class TestSessionActionQueueDequeue:
         assert type(next_action) is AttachmentUploadAction
 
     @pytest.mark.parametrize(
-        argnames=("queue_entry", "error_type"),
+        argnames=("queue_entry", "error_type", "expected_step_id", "expected_task_id"),
         argvalues=(
             pytest.param(
                 EnvironmentQueueEntry(
@@ -312,6 +313,8 @@ class TestSessionActionQueueDequeue:
                     ),
                 ),
                 EnvironmentDetailsError,
+                None,
+                None,
                 id="Environment Details Error",
             ),
             pytest.param(
@@ -326,6 +329,8 @@ class TestSessionActionQueueDequeue:
                     ),
                 ),
                 StepDetailsError,
+                "stepId",
+                "taskId",
                 id="Step Details Error",
             ),
         ),
@@ -333,7 +338,9 @@ class TestSessionActionQueueDequeue:
     def test_handle_job_entity_error_on_dequeue(
         self,
         queue_entry: (EnvironmentQueueEntry | TaskRunQueueEntry),
-        error_type: type[Exception],
+        error_type: type[SessionActionError],
+        expected_step_id: str | None,
+        expected_task_id: str | None,
         session_queue: SessionActionQueue,
     ) -> None:
         # GIVEN
@@ -347,9 +354,24 @@ class TestSessionActionQueueDequeue:
         job_entity_mock.job_attachment_details.side_effect = inner_error
         session_queue._job_entities = job_entity_mock
 
-        # WHEN / THEN
-        with pytest.raises(error_type):
+        # WHEN
+        with pytest.raises(error_type) as excinfo:
             session_queue.dequeue()
+
+        # THEN
+        # The Session error handler reads e.step_id/e.task_id when reporting the
+        # failure. They must be populated (not raise AttributeError) so that the
+        # action fails cleanly instead of triggering an unexpected worker error
+        # and reschedule loop.
+        assert excinfo.value.step_id == expected_step_id
+        assert excinfo.value.task_id == expected_task_id
+        # The failed action must be removed from the queue. If it were left
+        # queued, cancel_all() would re-report it as NEVER_ATTEMPTED and clobber
+        # the FAILED status the Session reports -- which the service rejects for
+        # the first session action, crashing the worker scheduler.
+        action_id = queue_entry.definition["sessionActionId"]
+        assert session_queue._actions == []
+        assert action_id not in session_queue._actions_by_id
 
     @pytest.mark.parametrize(
         argnames=("queue_entry"),
