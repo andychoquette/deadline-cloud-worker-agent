@@ -140,6 +140,7 @@ ignore = [
 # This causes imports to come after regular Python statements causing flake8 rule E402 to be flagged
 "src/deadline_worker_agent/**/*win*.py" = ["E402"]
 "test/**/*windows*.py" = ["E402"]
+"test/integ/macos/*.py" = ["E402"]
 
 [tool.ruff.lint.isort]
 known-first-party = [

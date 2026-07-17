@@ -1,0 +1,267 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+
+"""Integration tests for install_darwin.sh.
+
+These tests run the macOS installer for real (via sudo) and assert the
+invariants it must establish. They mutate host state -- users, groups,
+directories, a LaunchDaemon plist, and a sudoers file -- so they only run when
+RUN_INSTALLER_TESTS=true (set by the macos_installer_test.yml workflow, whose
+runners are throwaway VMs). The tests are ordered: installation happens in
+module-scoped fixtures and later tests build on earlier runs' state.
+
+The agent is installed from the repository checkout into a venv. The service is
+never left running: the farm/fleet ids are fakes, and the one test that loads
+the service with --start boots it out again.
+"""
+
+# This assertion short-circuits mypy from type checking this module on platforms other than macOS
+# https://mypy.readthedocs.io/en/stable/common_issues.html#python-version-and-system-platform-checks
+import sys
+
+assert sys.platform == "darwin"
+
+import os
+import plistlib
+import re
+import subprocess
+from pathlib import Path
+
+import pytest
+
+try:
+    from tomllib import load as load_toml
+except ModuleNotFoundError:
+    from tomli import load as load_toml
+
+FARM_ID = "farm-aabbccddeeff11223344556677889900"
+FLEET_ID = "fleet-00998877665544332211ffeeddccbbaa"
+REGION = "us-west-2"
+WA_USER = "deadline-worker"
+JOB_GROUP = "deadline-job-users"
+LAUNCHD_LABEL = "com.amazon.deadline.worker-agent"
+PLIST_PATH = Path("/Library/LaunchDaemons") / f"{LAUNCHD_LABEL}.plist"
+SUDOERS_PATH = Path("/etc/sudoers.d/deadline-worker-shutdown")
+
+REPO_ROOT = Path(__file__).parent.parent.parent.parent
+INSTALLER = REPO_ROOT / "src" / "deadline_worker_agent" / "installer" / "install_darwin.sh"
+
+pytestmark = pytest.mark.skipif(
+    os.environ.get("RUN_INSTALLER_TESTS", "").lower() != "true",
+    reason=(
+        "Skipping installer integration tests: they mutate host state (users, groups, "
+        "LaunchDaemon, sudoers) and only run when RUN_INSTALLER_TESTS=true"
+    ),
+)
+
+
+def run_installer(*extra_args: str, check: bool = True) -> subprocess.CompletedProcess:
+    """Runs install_darwin.sh via sudo with the standard test arguments."""
+    venv_bin = Path(os.environ["WA_VENV_BIN"])
+    cmd = [
+        "sudo",
+        "bash",
+        str(INSTALLER),
+        "--farm-id",
+        FARM_ID,
+        "--fleet-id",
+        FLEET_ID,
+        "--region",
+        REGION,
+        "--scripts-path",
+        str(venv_bin),
+        "--python-interpreter-path",
+        str(venv_bin / "python"),
+        "-y",
+        *extra_args,
+    ]
+    return subprocess.run(cmd, capture_output=True, text=True, check=check)
+
+
+def sudo_output(*cmd: str) -> str:
+    return subprocess.run(["sudo", *cmd], capture_output=True, text=True, check=True).stdout.strip()
+
+
+def dscl_read(path: str, key: str) -> str:
+    out = subprocess.run(
+        ["dscl", ".", "-read", path, key], capture_output=True, text=True, check=True
+    ).stdout
+    # Standard attributes print as "Key: value"; native ones as
+    # "dsAttrTypeNative:Key: value" -- take everything after the last colon.
+    return out.rsplit(":", 1)[1].strip()
+
+
+def user_exists(user: str) -> bool:
+    return (
+        subprocess.run(["dscl", ".", "-read", f"/Users/{user}"], capture_output=True).returncode
+        == 0
+    )
+
+
+def service_is_registered() -> bool:
+    return (
+        subprocess.run(
+            ["sudo", "launchctl", "print", f"system/{LAUNCHD_LABEL}"], capture_output=True
+        ).returncode
+        == 0
+    )
+
+
+def agent_process_running() -> bool:
+    return (
+        subprocess.run(["pgrep", "-f", "deadline-worker-agent"], capture_output=True).returncode
+        == 0
+    )
+
+
+class TestVfsRejection:
+    """--vfs-install-path is unsupported on macOS; it must fail before any mutation.
+
+    Runs first: it asserts that the agent user does not exist yet, which is only
+    meaningful before TestInstall's fixture has run the real installation.
+    """
+
+    def test_vfs_install_path_rejected_without_side_effects(self) -> None:
+        # GIVEN a system that has not had the installer run on it
+        assert not user_exists(WA_USER), "test ordering violated: installer already ran"
+
+        # WHEN
+        result = run_installer("--vfs-install-path", "/opt/deadline_vfs", check=False)
+
+        # THEN
+        assert result.returncode != 0
+        # AND nothing was created
+        assert not user_exists(WA_USER)
+        assert not PLIST_PATH.exists()
+
+
+@pytest.fixture(scope="module")
+def installed() -> subprocess.CompletedProcess:
+    """Runs the installer (with --allow-shutdown, without --start) once for this module."""
+    return run_installer("--allow-shutdown")
+
+
+class TestInstall:
+    """Invariants established by a plain install (no --start)."""
+
+    def test_agent_user_is_hidden_service_account(self, installed) -> None:
+        assert user_exists(WA_USER)
+        assert dscl_read(f"/Users/{WA_USER}", "IsHidden") == "1"
+        assert "/usr/bin/false" in dscl_read(f"/Users/{WA_USER}", "UserShell")
+
+    def test_agent_primary_group_is_not_job_group(self, installed) -> None:
+        """SECURITY INVARIANT: the agent user's PRIMARY group is its dedicated
+        per-user group -- never the job group, which is secondary-only. If this
+        inverts, job-user processes could read agent credentials."""
+        wa_gid = dscl_read(f"/Users/{WA_USER}", "PrimaryGroupID")
+        job_gid = dscl_read(f"/Groups/{JOB_GROUP}", "PrimaryGroupID")
+        assert wa_gid != job_gid
+        # The primary gid resolves to the agent's dedicated self-named group
+        assert dscl_read(f"/Groups/{WA_USER}", "PrimaryGroupID") == wa_gid
+        # Job group membership is secondary
+        groups = subprocess.run(
+            ["id", "-Gn", WA_USER], capture_output=True, text=True, check=True
+        ).stdout.split()
+        assert JOB_GROUP in groups
+
+    @pytest.mark.parametrize(
+        ("path", "expected_mode", "expected_owner"),
+        [
+            ("/var/lib/deadline/credentials", "700", WA_USER),
+            ("/etc/amazon/deadline", "750", "root"),
+            ("/etc/amazon/deadline/worker.toml", "640", "root"),
+            ("/var/log/amazon/deadline", "750", WA_USER),
+        ],
+    )
+    def test_file_modes(
+        self, installed, path: str, expected_mode: str, expected_owner: str
+    ) -> None:
+        # sudo is required to stat inside these directories: the test user is in
+        # neither the agent group nor the job group, so unprivileged access is
+        # denied -- which is itself the isolation working (asserted below).
+        assert sudo_output("stat", "-f", "%Lp %Su", path) == f"{expected_mode} {expected_owner}"
+
+    def test_session_root_is_under_var(self, installed) -> None:
+        # /var is writable; the sealed read-only root volume is not (macOS 10.15+)
+        assert (
+            subprocess.run(
+                ["sudo", "test", "-d", "/var/lib/deadline/sessions"], capture_output=True
+            ).returncode
+            == 0
+        )
+
+    def test_credentials_denied_to_unprivileged_user(self, installed) -> None:
+        with pytest.raises(PermissionError):
+            os.stat("/var/lib/deadline/credentials/anything")
+
+    def test_worker_toml_contains_configuration(self, installed) -> None:
+        raw = sudo_output("cat", "/etc/amazon/deadline/worker.toml")
+        # Parse rather than grep so we validate the file is well-formed TOML too
+        import io
+
+        config = load_toml(io.BytesIO(raw.encode()))
+        assert config["worker"]["farm_id"] == FARM_ID
+        assert config["worker"]["fleet_id"] == FLEET_ID
+
+    def test_plist_is_boot_ready_and_root_owned(self, installed) -> None:
+        # launchd rejects group/other-writable daemon plists
+        assert sudo_output("stat", "-f", "%Lp %Su %Sg", str(PLIST_PATH)) == "644 root wheel"
+        plist = plistlib.loads(PLIST_PATH.read_bytes())
+        assert plist["Label"] == LAUNCHD_LABEL
+        # Runs as the agent user, not root
+        assert plist["UserName"] == WA_USER
+        # Boot-ready: RunAtLoad=true starts it whenever launchd loads it (every
+        # boot -- the systemctl-enable analog), KeepAlive restarts it on failure
+        assert plist["RunAtLoad"] is True
+        assert plist["KeepAlive"] == {"SuccessfulExit": False}
+
+    def test_service_not_loaded_without_start(self, installed) -> None:
+        """Without --start the installer must NOT load (bootstrap) the service:
+        not registered with launchd, and no agent process running."""
+        assert not service_is_registered()
+        assert not agent_process_running()
+
+    def test_sudoers_grants_exactly_shutdown(self, installed) -> None:
+        assert sudo_output("stat", "-f", "%Lp %Su", str(SUDOERS_PATH)) == "440 root"
+        # visudo validates the syntax
+        subprocess.run(["sudo", "visudo", "-cf", str(SUDOERS_PATH)], check=True)
+        content = sudo_output("cat", str(SUDOERS_PATH))
+        assert re.search(
+            rf"^{WA_USER} ALL=\(root\) NOPASSWD: /sbin/shutdown -h now$", content, re.MULTILINE
+        )
+
+
+class TestReinstall:
+    """Behavior of running the installer again over an existing installation."""
+
+    def test_reinstall_is_idempotent(self, installed) -> None:
+        run_installer("--allow-shutdown")
+        # Spot-check that the security invariants survived the re-run
+        wa_gid = dscl_read(f"/Users/{WA_USER}", "PrimaryGroupID")
+        job_gid = dscl_read(f"/Groups/{JOB_GROUP}", "PrimaryGroupID")
+        assert wa_gid != job_gid
+        assert (
+            sudo_output("stat", "-f", "%Lp %Su", "/var/lib/deadline/credentials")
+            == f"700 {WA_USER}"
+        )
+        plistlib.loads(PLIST_PATH.read_bytes())
+        subprocess.run(["sudo", "visudo", "-cf", str(SUDOERS_PATH)], check=True)
+
+    def test_reinstall_without_allow_shutdown_revokes_sudoers(self, installed) -> None:
+        run_installer()
+        assert not SUDOERS_PATH.exists()
+
+    def test_install_with_start_registers_service(self, installed) -> None:
+        """--start loads the service with launchd, which also proves launchd
+        accepts the generated plist beyond XML well-formedness. The agent
+        process itself cannot authenticate against the fake farm/fleet and may
+        be mid-restart when we look, so only registration is asserted."""
+        run_installer("--start")
+        try:
+            assert service_is_registered()
+        finally:
+            # The crash-looping agent must not outlive the test
+            subprocess.run(
+                ["sudo", "launchctl", "bootout", f"system/{LAUNCHD_LABEL}"],
+                capture_output=True,
+            )
+        assert not service_is_registered()
