@@ -529,15 +529,16 @@ if ! [[ "${no_install_service}" == "yes" ]]; then
         prog_args_xml+="        <string>${token}</string>"$'\n'
     done
 
-    # RunAtLoad controls whether the daemon runs immediately when it is bootstrapped and on
-    # every boot. We gate it on --start so macOS matches the Linux installer's behavior: without
-    # --start the daemon is registered but not started now (Linux runs `systemctl enable` only),
-    # and with --start it starts immediately and on boot (Linux runs `systemctl start` too).
-    if [[ "${start_service}" == "yes" ]]; then
-        run_at_load="true"
-    else
-        run_at_load="false"
-    fi
+    # launchd has no separate "start on boot" and "start on load" controls: RunAtLoad governs
+    # both, and loading happens at every boot for /Library/LaunchDaemons plists as well as at
+    # `launchctl bootstrap`. So to reproduce the Linux installer's semantics --
+    #   * `systemctl enable` always: start on (next) boot
+    #   * `systemctl start` only with --start: start now
+    # -- the plist is always written boot-ready (RunAtLoad=true plus KeepAlive/SuccessfulExit,
+    # the systemd Restart=on-failure analog; note KeepAlive implies a load-time start per
+    # launchd.plist(5), which is fine because we want every load to start the daemon), and it
+    # is the `launchctl bootstrap` (load-now) that is gated on --start below. Installing the
+    # plist into /Library/LaunchDaemons is itself the boot-time registration.
 
     # NOTE ON MAPPINGS from the systemd unit:
     #   User=                 -> UserName
@@ -578,7 +579,7 @@ ${prog_args_xml}    </array>
         <false/>
     </dict>
     <key>RunAtLoad</key>
-    <${run_at_load}/>
+    <true/>
     <key>StandardOutPath</key>
     <string>/dev/null</string>
     <key>StandardErrorPath</key>
@@ -593,27 +594,27 @@ EOF
     chmod 644 "${launchd_plist}"
     echo "Done installing launchd LaunchDaemon"
 
-    # Idempotent (re)load: bootout an already-loaded instance before bootstrap, otherwise
-    # `bootstrap` fails with "service already bootstrapped".
+    # Idempotent (re)load: bootout an already-loaded instance so a re-install picks up the new
+    # plist. Without --start we leave the service unloaded -- the plist in /Library/LaunchDaemons
+    # makes launchd load (and, per RunAtLoad, start) it on the next boot, which is exactly the
+    # Linux `systemctl enable`-without-`systemctl start` behavior.
     # UNVERIFIED: `bootout` returns non-zero if the service is not loaded; we tolerate that with `|| true`.
     if launchctl print "system/${launchd_label}" &> /dev/null; then
-        echo "Existing LaunchDaemon detected; unloading before reload"
+        echo "Existing LaunchDaemon detected; unloading"
         launchctl bootout system "${launchd_plist}" &> /dev/null || true
     fi
-
-    # bootstrap loads the daemon and enables start-on-boot; enable keeps it eligible to run.
-    # Whether it also starts *now* is governed by RunAtLoad (gated on --start above), matching
-    # the Linux installer where `systemctl enable` always runs but `systemctl start` is --start-only.
-    echo "Bootstrapping and enabling the LaunchDaemon"
-    launchctl bootstrap system "${launchd_plist}"
     launchctl enable "system/${launchd_label}"
 
     if [[ "${start_service}" == "yes" ]]; then
-        # RunAtLoad=true means bootstrap already started it; kickstart -k guarantees an immediate
-        # (re)start even if bootstrap raced or the service was previously loaded.
-        echo "Starting the service"
+        # Load now; RunAtLoad=true makes bootstrap start the daemon immediately (the Linux
+        # `systemctl start` analog). kickstart -k guarantees an immediate (re)start even if
+        # bootstrap raced.
+        echo "Bootstrapping and starting the LaunchDaemon"
+        launchctl bootstrap system "${launchd_plist}"
         launchctl kickstart -k "system/${launchd_label}"
         echo "Done starting the service"
+    else
+        echo "LaunchDaemon installed; it will start on the next boot (use --start to start it now)"
     fi
 fi
 
