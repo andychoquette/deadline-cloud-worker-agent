@@ -124,6 +124,17 @@ module = [
     "botocore.*"
 ]
 
+# numpy is not used by this package; it arrives transitively (via
+# deadline-cloud-test-fixtures >= 0.18.16) and mypy reaches its stubs through
+# pytest's `approx` implementation. numpy 2.5+ type stubs use PEP 695 `type`
+# statements, which mypy rejects while python_version is pinned below 3.12, so
+# do not follow imports into it. follow_imports_for_stubs is required for
+# follow_imports to apply to .pyi files like numpy/__init__.pyi.
+[[tool.mypy.overrides]]
+module = [ "numpy", "numpy.*" ]
+follow_imports = "skip"
+follow_imports_for_stubs = true
+
 [tool.ruff]
 line-length = 100
 
