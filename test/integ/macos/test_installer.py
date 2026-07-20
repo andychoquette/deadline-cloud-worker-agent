@@ -265,3 +265,50 @@ class TestReinstall:
                 capture_output=True,
             )
         assert not service_is_registered()
+
+    def test_reinstall_with_start_survives_bootout_race(self, installed) -> None:
+        """A re-install with --start over an already-loaded service must not
+        abort on the asynchronous bootout/bootstrap race: launchd may still be
+        unloading the old instance when the new bootstrap runs."""
+        run_installer("--start")
+        try:
+            assert service_is_registered()
+            # Immediately re-install over the loaded (crash-looping) service
+            result = run_installer("--start", check=False)
+            assert result.returncode == 0, result.stdout + result.stderr
+            assert service_is_registered()
+        finally:
+            subprocess.run(
+                ["sudo", "launchctl", "bootout", f"system/{LAUNCHD_LABEL}"],
+                capture_output=True,
+            )
+        assert not service_is_registered()
+
+    def test_reinstall_without_start_restores_loaded_service(self, installed) -> None:
+        """A config-only re-run (no --start) over a LOADED service must put the
+        service back afterward -- matching Linux, where a re-run without
+        `systemctl start` leaves a running service running. Without this, a
+        config change (e.g. toggling --allow-shutdown) would silently take the
+        worker offline until the next reboot."""
+        run_installer("--start")
+        try:
+            assert service_is_registered()
+            # Config-only re-run: no --start
+            run_installer()
+            assert service_is_registered(), (
+                "re-install without --start left the previously-loaded service stopped"
+            )
+        finally:
+            subprocess.run(
+                ["sudo", "launchctl", "bootout", f"system/{LAUNCHD_LABEL}"],
+                capture_output=True,
+            )
+        assert not service_is_registered()
+
+    def test_reinstall_without_start_over_unloaded_service_stays_unloaded(self, installed) -> None:
+        """The restore logic must not overreach: a re-run without --start over
+        an UNLOADED service must leave it unloaded (only boot starts it)."""
+        assert not service_is_registered(), "test precondition: service must be unloaded"
+        run_installer()
+        assert not service_is_registered()
+        assert not agent_process_running()

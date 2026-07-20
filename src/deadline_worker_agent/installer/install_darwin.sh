@@ -595,22 +595,40 @@ EOF
     echo "Done installing launchd LaunchDaemon"
 
     # Idempotent (re)load: bootout an already-loaded instance so a re-install picks up the new
-    # plist. Without --start we leave the service unloaded -- the plist in /Library/LaunchDaemons
-    # makes launchd load (and, per RunAtLoad, start) it on the next boot, which is exactly the
-    # Linux `systemctl enable`-without-`systemctl start` behavior.
-    # UNVERIFIED: `bootout` returns non-zero if the service is not loaded; we tolerate that with `|| true`.
+    # plist. Remember whether it was loaded: a config-only re-run (no --start) over a loaded
+    # service must put the service back afterward, matching Linux where a re-run without
+    # `systemctl start` leaves a running service running.
+    was_loaded="no"
     if launchctl print "system/${launchd_label}" &> /dev/null; then
         echo "Existing LaunchDaemon detected; unloading"
+        was_loaded="yes"
+        # bootout returns non-zero if the service is not loaded; tolerate the race.
         launchctl bootout system "${launchd_plist}" &> /dev/null || true
     fi
     launchctl enable "system/${launchd_label}"
 
-    if [[ "${start_service}" == "yes" ]]; then
+    if [[ "${start_service}" == "yes" ]] || [[ "${was_loaded}" == "yes" ]]; then
         # Load now; RunAtLoad=true makes bootstrap start the daemon immediately (the Linux
-        # `systemctl start` analog). kickstart -k guarantees an immediate (re)start even if
-        # bootstrap raced.
+        # `systemctl start` analog -- or, in the re-install case, the restore of the
+        # previously-loaded service).
+        #
+        # `bootout` above is asynchronous: launchd may still be unloading the old instance
+        # when we bootstrap, which fails transiently ("service already loaded" / EIO). Retry
+        # briefly rather than aborting the install on the race.
         echo "Bootstrapping and starting the LaunchDaemon"
-        launchctl bootstrap system "${launchd_plist}"
+        bootstrap_ok="no"
+        for _ in $(seq 1 10); do
+            if launchctl bootstrap system "${launchd_plist}" &> /dev/null; then
+                bootstrap_ok="yes"
+                break
+            fi
+            sleep 1
+        done
+        if [[ "${bootstrap_ok}" != "yes" ]]; then
+            # Surface the real error for the operator.
+            launchctl bootstrap system "${launchd_plist}"
+        fi
+        # kickstart -k guarantees an immediate (re)start even if bootstrap raced.
         launchctl kickstart -k "system/${launchd_label}"
         echo "Done starting the service"
     else
