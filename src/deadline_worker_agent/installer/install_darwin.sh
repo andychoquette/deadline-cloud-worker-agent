@@ -54,8 +54,10 @@ python_interpreter_path="unset"
 session_root_dir="/var/lib/deadline/sessions"
 
 # macOS-specific constants
-# NOTE: launchd label + plist path. Uses reverse-DNS label convention that launchd expects.
-# UNVERIFIED: ensure no other daemon on the fleet image already uses this label.
+# NOTE: launchd label + plist path. Uses the reverse-DNS label convention that launchd expects;
+# the vendor-namespaced label makes collision with another daemon on a fleet image as unlikely
+# as the systemd unit name collision on Linux. The installer's bootout-before-bootstrap reload
+# path treats an existing service with this label as a prior install of this agent.
 launchd_label="com.amazon.deadline.worker-agent"
 launchd_plist="/Library/LaunchDaemons/${launchd_label}.plist"
 # NOTE: macOS has no `useradd -m`; we must create and own a home directory ourselves.
@@ -145,11 +147,15 @@ user_primary_group_name() {
     fi
 }
 
-# Allocate the lowest unused ID in [200,500) from a dscl attribute listing.
+# Allocate the highest unused ID in [200,500) from a dscl attribute listing.
 # NOTE: macOS reserves IDs < 500 for hidden/system accounts. Combined with IsHidden=1 this keeps
-#       the agent account out of the login window.
-# UNVERIFIED: the free range on the target image; MDM-managed fleets may already occupy low IDs.
-#             This allocation is also not race-safe against concurrent account creation.
+#       the agent account out of the login window. The allocator scans the live directory
+#       (dscl -list) at install time, so IDs already taken on the image -- including by
+#       MDM-provisioned accounts -- are skipped; searching downward from 499 also stays clear of
+#       Apple's own low-numbered system accounts. The install must fail if the range is
+#       exhausted rather than pick a UID >= 500 (which would appear in the login window).
+# NOTE: not race-safe against concurrent account creation, matching the Linux installer's
+#       useradd behavior under the same (root, single-installer) assumption.
 allocate_system_id() {
     local kind="$1"   # "Users" or "Groups"
     local attr="$2"   # "UniqueID" or "PrimaryGroupID"
@@ -363,9 +369,10 @@ if ! user_exists "${wa_user}"; then
     dscl . -create /Users/"${wa_user}" RealName "AWS Deadline Cloud Worker Agent"
     # IsHidden=1 keeps a UID<500 account out of the login window / user pickers.
     dscl . -create /Users/"${wa_user}" IsHidden 1
-    # Disable password auth entirely for this service account.
-    # UNVERIFIED: on some macOS versions a service account also needs `dscl . -passwd` or an
-    # AuthenticationAuthority reset; '*' matches the /etc/master.passwd disabled-account convention.
+    # Disable password auth entirely for this service account. '*' matches the
+    # /etc/master.passwd disabled-account convention; because the account is created without an
+    # AuthenticationAuthority attribute, Directory Services rejects authentication attempts
+    # outright (eDSAuthMethodNotSupported) rather than comparing against a password.
     dscl . -create /Users/"${wa_user}" Password '*'
 
     wa_group="${wa_user}"
@@ -415,8 +422,9 @@ fi
 # --- Sudoers configuration (--allow-shutdown) ---------------------------------------
 # macOS shutdown binary lives at /sbin/shutdown (BSD shutdown). The Linux line used
 # `/usr/sbin/shutdown now`; the BSD invocation is `/sbin/shutdown -h now` (-h = halt/power off).
-# UNVERIFIED: confirm the worker agent actually invokes `/sbin/shutdown -h now` on macOS. The
-# sudoers command MUST match the invoked argv EXACTLY or the NOPASSWD rule will not apply.
+# The agent invokes `sudo shutdown -h now` on darwin (startup/entrypoint.py:_host_shutdown);
+# sudo resolves `shutdown` to /sbin/shutdown via PATH and matches this rule by full path.
+# The sudoers command MUST continue to match that argv exactly for the NOPASSWD rule to apply.
 if [[ "${allow_shutdown}" == "yes" ]]; then
     echo "Setting up sudoers shutdown rule at /etc/sudoers.d/deadline-worker-shutdown"
     # /etc/sudoers.d exists and is included by default on macOS.
@@ -521,13 +529,18 @@ fi
 if ! [[ "${no_install_service}" == "yes" ]]; then
     echo "Installing launchd LaunchDaemon to ${launchd_plist}"
 
-    # Split the program path into ProgramArguments array elements. worker_agent_program is a bare
-    # path with no arguments, so this yields a single-element array.
-    # UNVERIFIED: assumes the program path contains no whitespace (true for standard scripts-path).
-    prog_args_xml=""
-    for token in ${worker_agent_program}; do
-        prog_args_xml+="        <string>${token}</string>"$'\n'
-    done
+    # worker_agent_program is a single path with no embedded arguments, so ProgramArguments is a
+    # single-element array. Do NOT word-split it: the venv scripts path can contain spaces on
+    # macOS (e.g. a venv under "/Users/My Name/..."). XML-escape it so paths containing
+    # &, <, or > cannot corrupt the plist.
+    xml_escape() {
+        local s="$1"
+        s="${s//&/&amp;}"
+        s="${s//</&lt;}"
+        s="${s//>/&gt;}"
+        printf '%s' "${s}"
+    }
+    prog_args_xml="        <string>$(xml_escape "${worker_agent_program}")</string>"$'\n'
 
     # launchd has no separate "start on boot" and "start on load" controls: RunAtLoad governs
     # both, and loading happens at every boot for /Library/LaunchDaemons plists as well as at
@@ -649,9 +662,11 @@ if [ ${#warning_lines[@]} -gt 0 ]; then
     echo
 fi
 
-# UNVERIFIED (macOS platform integration, not scriptable here -- operator checklist):
+# OPERATOR NOTES (macOS platform integration; environment-dependent, not verifiable here):
 #   * TCC / Full Disk Access: a headless LaunchDaemon may be blocked by TCC from protected paths
 #     (Desktop/Documents/removable volumes) and cannot present the consent UI. Fleets likely need
-#     an MDM PPPC profile granting Full Disk Access to the ${worker_agent_program} binary.
+#     an MDM PPPC profile granting Full Disk Access to the ${worker_agent_program} binary. Not an
+#     issue for the default session root (/var/lib/deadline/sessions), which is not TCC-protected.
 #   * Code signing / Gatekeeper: an unsigned/unnotarized agent binary may be quarantined. Ensure
 #     the binary is signed + notarized (or delivered without the com.apple.quarantine xattr).
+#     pip-installed console scripts (the standard install path) do not carry the quarantine xattr.

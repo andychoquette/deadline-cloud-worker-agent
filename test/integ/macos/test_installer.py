@@ -213,6 +213,50 @@ class TestInstall:
         # boot -- the systemctl-enable analog), KeepAlive restarts it on failure
         assert plist["RunAtLoad"] is True
         assert plist["KeepAlive"] == {"SuccessfulExit": False}
+        # ProgramArguments is exactly one element: the agent binary path. A
+        # word-split bug would fracture a path containing spaces into multiple
+        # argv elements (see test_plist_program_arguments_survive_spaced_path).
+        venv_bin = Path(os.environ["WA_VENV_BIN"])
+        assert plist["ProgramArguments"] == [str(venv_bin / "deadline-worker-agent")]
+
+    def test_plist_program_arguments_survive_spaced_path(self, installed, tmp_path) -> None:
+        """A scripts path containing a space (e.g. a venv under '/Users/My Name')
+        must produce a single, intact ProgramArguments element."""
+        spaced_dir = tmp_path / "spaced dir" / "bin"
+        spaced_dir.mkdir(parents=True)
+        venv_bin = Path(os.environ["WA_VENV_BIN"])
+        agent_program = spaced_dir / "deadline-worker-agent"
+        agent_program.symlink_to(venv_bin / "deadline-worker-agent")
+        # World-traversable so the installer's checks and launchd can read it
+        tmp_path.chmod(0o755)
+        (tmp_path / "spaced dir").chmod(0o755)
+        spaced_dir.chmod(0o755)
+
+        result = subprocess.run(
+            [
+                "sudo",
+                "bash",
+                str(INSTALLER),
+                "--farm-id",
+                FARM_ID,
+                "--fleet-id",
+                FLEET_ID,
+                "--region",
+                REGION,
+                "--scripts-path",
+                str(spaced_dir),
+                "--python-interpreter-path",
+                str(venv_bin / "python"),
+                "-y",
+            ],
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        plist = plistlib.loads(PLIST_PATH.read_bytes())
+        assert plist["ProgramArguments"] == [str(agent_program)]
+        # Restore the standard plist for subsequent tests
+        run_installer("--allow-shutdown")
 
     def test_service_not_loaded_without_start(self, installed) -> None:
         """Without --start the installer must NOT load (bootstrap) the service:
