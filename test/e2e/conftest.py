@@ -577,9 +577,15 @@ def operating_system() -> OperatingSystem:
         return OperatingSystem(name="AL2023")
     elif os_env_var == "windows":
         return OperatingSystem(name="WIN2022")
+    elif os_env_var == "macos":
+        # NOTE: requires a deadline-cloud-test-fixtures release whose
+        # OperatingSystem/worker fixtures accept a macOS platform (EC2 Mac
+        # dedicated hosts). The test-suite plumbing here is ready ahead of that.
+        return OperatingSystem(name="MACOS")
     else:
         assert False, (
-            f'Expected OPERATING_SYSTEM env var to be "linux" or "windows", but got {os_env_var}'
+            f'Expected OPERATING_SYSTEM env var to be "linux", "windows", or "macos", '
+            f"but got {os_env_var}"
         )
 
 
