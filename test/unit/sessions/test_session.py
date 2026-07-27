@@ -46,6 +46,7 @@ from deadline_worker_agent.api_models import (
 )
 from deadline_worker_agent.sessions import Session
 from deadline_worker_agent.sessions.runtime import SessionRuntime
+from deadline_worker_agent._session_runtime_kind import SessionRuntimeKind
 import deadline_worker_agent.sessions.session as session_mod
 from deadline_worker_agent.sessions.session import (
     CurrentAction,
@@ -492,6 +493,71 @@ class TestSessionInit:
         mock_create_runtime.assert_called_once()
         config = mock_create_runtime.call_args[0][1]
         assert config.session_root_directory == session_root_dir
+
+
+class TestSessionRuntimeKind:
+    """Tests that Session passes the correct session_runtime_kind to create_session_runtime."""
+
+    def test_explicit_runtime_kind_passed(
+        self,
+        asset_sync: MagicMock,
+        job_details: "JobDetails",
+        os_user: "SessionUser | None",
+        mock_create_runtime: MagicMock,
+        queue_id: str,
+        session_action_queue: MagicMock,
+        action_update_callback: MagicMock,
+        action_update_lock: MagicMock,
+        session_root_dir: Path,
+    ) -> None:
+        """When session_runtime_kind=RUST is passed, RUST is forwarded to create_session_runtime."""
+        Session(
+            id="session-test-rust",
+            asset_sync=asset_sync,
+            env=None,
+            job_details=job_details,
+            os_user=os_user,
+            queue=session_action_queue,
+            queue_id=queue_id,
+            job_id="job-1234",
+            action_update_callback=action_update_callback,
+            action_update_lock=action_update_lock,
+            session_root_dir=session_root_dir,
+            session_runtime_kind=SessionRuntimeKind.RUST,
+        )
+
+        mock_create_runtime.assert_called_once()
+        assert mock_create_runtime.call_args[0][0] == SessionRuntimeKind.RUST
+
+    def test_default_runtime_kind_is_python(
+        self,
+        asset_sync: MagicMock,
+        job_details: "JobDetails",
+        os_user: "SessionUser | None",
+        mock_create_runtime: MagicMock,
+        queue_id: str,
+        session_action_queue: MagicMock,
+        action_update_callback: MagicMock,
+        action_update_lock: MagicMock,
+        session_root_dir: Path,
+    ) -> None:
+        """When session_runtime_kind is omitted, PYTHON is forwarded to create_session_runtime."""
+        Session(
+            id="session-test-default",
+            asset_sync=asset_sync,
+            env=None,
+            job_details=job_details,
+            os_user=os_user,
+            queue=session_action_queue,
+            queue_id=queue_id,
+            job_id="job-1234",
+            action_update_callback=action_update_callback,
+            action_update_lock=action_update_lock,
+            session_root_dir=session_root_dir,
+        )
+
+        mock_create_runtime.assert_called_once()
+        assert mock_create_runtime.call_args[0][0] == SessionRuntimeKind.PYTHON
 
 
 class TestSessionOuterRun:
