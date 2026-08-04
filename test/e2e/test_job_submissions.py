@@ -34,6 +34,9 @@ from e2e.utils import (
 
 LOG = logging.getLogger(__name__)
 
+# launchd service label installed by installer/install_darwin.sh on macOS workers.
+MACOS_LAUNCHD_LABEL = "com.amazon.deadline.worker-agent"
+
 
 class TestJobSubmission:
     JOB_OUTPUT_PATH = os.path.join(os.getcwd(), "job_output")
@@ -1924,8 +1927,15 @@ class TestJobSubmission:
             run_script=sleep_script,
         )
 
-        if os.environ["OPERATING_SYSTEM"] != "windows":
+        # Stopping the service sends the agent a SIGTERM (or the Windows service stop
+        # equivalent), which is what triggers the drain. The command differs by service
+        # manager: systemd on Linux, launchd on macOS, and the Windows service manager.
+        if os.environ["OPERATING_SYSTEM"] == "linux":
             cmd_result = function_worker.send_command("sudo systemctl stop deadline-worker")
+        elif os.environ["OPERATING_SYSTEM"] == "macos":
+            cmd_result = function_worker.send_command(
+                f"sudo launchctl bootout system/{MACOS_LAUNCHD_LABEL}"
+            )
         else:
             cmd_result = function_worker.send_command("sc.exe stop DeadlineWorker")
 

@@ -1003,7 +1003,13 @@ if __name__ == "__main__":
                 '   combined_contents+="$(cat "$file" | tr -d \'\\n\')"\n'
                 "   fi\n"
                 "done\n"
-                "sha256_hash=$(echo -n \"$combined_contents\" | sha256sum | awk '{ print $1 }')\n"
+                # sha256sum is GNU coreutils and is not present on macOS, which ships shasum
+                # instead. Both emit "<hex digest>  -", so awk extracts the digest either way.
+                "if command -v sha256sum > /dev/null 2>&1; then\n"
+                "   sha256_hash=$(echo -n \"$combined_contents\" | sha256sum | awk '{ print $1 }')\n"
+                "else\n"
+                "   sha256_hash=$(echo -n \"$combined_contents\" | shasum -a 256 | awk '{ print $1 }')\n"
+                "fi\n"
                 'echo -n "$sha256_hash" > {{Param.DataDir}}/output_file.txt'
                 if os.environ["OPERATING_SYSTEM"] != "windows"
                 else '$InputFolder = "{{Param.DataDir}}\\files"\n'
