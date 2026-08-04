@@ -356,3 +356,39 @@ class TestReinstall:
         run_installer()
         assert not service_is_registered()
         assert not agent_process_running()
+
+    def test_reinstall_over_loaded_service_warns_about_restart(self, installed) -> None:
+        """launchd cannot reload a changed plist in place, so a re-install
+        restarts a running agent and interrupts any session it is running --
+        a divergence from Linux, where a config-only re-run leaves the running
+        process untouched. The installer must say so rather than doing it
+        silently."""
+        run_installer("--start")
+        try:
+            assert service_is_registered()
+            result = run_installer()
+            assert "restarted" in result.stdout, (
+                f"re-install over a loaded service did not warn about the restart: {result.stdout}"
+            )
+        finally:
+            subprocess.run(
+                ["sudo", "launchctl", "bootout", f"system/{LAUNCHD_LABEL}"],
+                capture_output=True,
+            )
+        assert not service_is_registered()
+
+    def test_first_install_does_not_warn_about_restart(self, installed) -> None:
+        """The restart warning must be specific to the re-install-over-loaded
+        case: a first install has no running agent to interrupt."""
+        assert not service_is_registered(), "test precondition: service must be unloaded"
+        result = run_installer("--start")
+        try:
+            assert "restarted" not in result.stdout, (
+                f"install over an unloaded service warned about a restart: {result.stdout}"
+            )
+        finally:
+            subprocess.run(
+                ["sudo", "launchctl", "bootout", f"system/{LAUNCHD_LABEL}"],
+                capture_output=True,
+            )
+        assert not service_is_registered()

@@ -611,10 +611,22 @@ EOF
     # plist. Remember whether it was loaded: a config-only re-run (no --start) over a loaded
     # service must put the service back afterward, matching Linux where a re-run without
     # `systemctl start` leaves a running service running.
+    #
+    # DIVERGENCE FROM LINUX: this restarts a running agent. launchd has no way to reload a
+    # changed plist in place (the systemd `daemon-reload` analog) -- the service must be
+    # booted out and back in -- so unlike a Linux config-only re-run, which leaves the
+    # running process untouched, a macOS re-install terminates the agent. Any session the
+    # agent is currently running is interrupted. Warn the operator rather than doing this
+    # silently.
     was_loaded="no"
     if launchctl print "system/${launchd_label}" &> /dev/null; then
         echo "Existing LaunchDaemon detected; unloading"
         was_loaded="yes"
+        warning_lines+=(
+            "The worker agent service was running and has been restarted to load the updated"
+            "configuration. Any session it was running was interrupted. (macOS/launchd cannot"
+            "reload a changed LaunchDaemon plist without restarting the service.)"
+        )
         # bootout returns non-zero if the service is not loaded; tolerate the race.
         launchctl bootout system "${launchd_plist}" &> /dev/null || true
     fi
@@ -638,11 +650,29 @@ EOF
             sleep 1
         done
         if [[ "${bootstrap_ok}" != "yes" ]]; then
-            # Surface the real error for the operator.
-            launchctl bootstrap system "${launchd_plist}"
+            if launchctl print "system/${launchd_label}" &> /dev/null; then
+                # bootstrap kept failing because the service is still loaded: the old
+                # instance never fully unloaded and won the race. kickstart -k forces it to
+                # (re)start so the operator is not left with a stopped agent. launchd is
+                # still holding the OLD plist in this case, so the config we just wrote does
+                # not take effect until the service is reloaded -- say so.
+                echo "Service still loaded after bootout; forcing a restart"
+                launchctl kickstart -k "system/${launchd_label}"
+                warning_lines+=(
+                    "The previous worker agent service could not be unloaded, so launchd is still"
+                    "using the previous configuration. Reboot, or run"
+                    "\`launchctl bootout system/${launchd_label}\` followed by"
+                    "\`launchctl bootstrap system ${launchd_plist}\`, to apply the new configuration."
+                )
+            else
+                # Not loaded, and bootstrap will not take it. Re-run unguarded so the real
+                # launchd error reaches the operator; set -e then aborts the install.
+                launchctl bootstrap system "${launchd_plist}"
+            fi
         fi
-        # kickstart -k guarantees an immediate (re)start even if bootstrap raced.
-        launchctl kickstart -k "system/${launchd_label}"
+        # After a clean bootstrap, RunAtLoad has already started the daemon -- no kickstart
+        # here, since an unconditional `-k` would kill and respawn a healthy process (and
+        # interrupt its session) for no reason.
         echo "Done starting the service"
     else
         echo "LaunchDaemon installed; it will start on the next boot (use --start to start it now)"
