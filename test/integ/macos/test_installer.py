@@ -41,6 +41,7 @@ JOB_GROUP = "deadline-job-users"
 LAUNCHD_LABEL = "com.amazon.deadline.worker-agent"
 PLIST_PATH = Path("/Library/LaunchDaemons") / f"{LAUNCHD_LABEL}.plist"
 SUDOERS_PATH = Path("/etc/sudoers.d/deadline-worker-shutdown")
+JOB_USERS_SUDOERS_PATH = Path("/etc/sudoers.d/deadline-worker-job-users")
 
 REPO_ROOT = Path(__file__).parent.parent.parent.parent
 INSTALLER = REPO_ROOT / "src" / "deadline_worker_agent" / "installer" / "install_darwin.sh"
@@ -263,6 +264,35 @@ class TestInstall:
         not registered with launchd, and no agent process running."""
         assert not service_is_registered()
         assert not agent_process_running()
+
+    def test_sudoers_grants_job_user_impersonation(self, installed) -> None:
+        """openjd-sessions runs a Session's actions as the queue's jobRunAsUser via
+        `sudo -u <job-user> -i ...`, which requires passwordless sudo. Unlike Linux,
+        where the distro's stock sudoers already covers the agent user, macOS grants
+        a hidden UID<500 service account nothing, and a LaunchDaemon has no TTY for
+        sudo to prompt on -- so without this rule every impersonated action fails
+        with "sudo: a terminal is required to read the password"."""
+        assert JOB_USERS_SUDOERS_PATH.exists(), (
+            "installer did not create the jobRunAsUser sudoers rule"
+        )
+        assert sudo_output("stat", "-f", "%Lp %Su", str(JOB_USERS_SUDOERS_PATH)) == "440 root"
+        # A malformed file here breaks sudo host-wide, so it must parse.
+        subprocess.run(["sudo", "visudo", "-cf", str(JOB_USERS_SUDOERS_PATH)], check=True)
+        content = sudo_output("cat", str(JOB_USERS_SUDOERS_PATH))
+        # Scoped to the job GROUP: the queue picks the jobRunAsUser, and the installer
+        # cannot know which member of the group that will be.
+        assert re.search(
+            rf"^{WA_USER} ALL=\(%{JOB_GROUP}\) NOPASSWD: ALL$", content, re.MULTILINE
+        ), f"unexpected rule contents: {content}"
+
+    def test_sudoers_job_user_rule_does_not_grant_root(self, installed) -> None:
+        """The impersonation rule must not become a general root escalation for the
+        agent user: it is scoped to the job group's runas list only."""
+        content = sudo_output("cat", str(JOB_USERS_SUDOERS_PATH))
+        assert "ALL=(ALL)" not in content
+        assert "(root)" not in content
+        # Absent --allow-shutdown there is no root-granting rule at all.
+        assert not SUDOERS_PATH.exists() or "root" not in sudo_output("cat", str(SUDOERS_PATH))
 
     def test_sudoers_grants_exactly_shutdown(self, installed) -> None:
         assert sudo_output("stat", "-f", "%Lp %Su", str(SUDOERS_PATH)) == "440 root"

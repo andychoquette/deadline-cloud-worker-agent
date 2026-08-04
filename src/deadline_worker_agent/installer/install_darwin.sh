@@ -443,6 +443,40 @@ else
     echo "No prior sudoers shutdown rule at /etc/sudoers.d/deadline-worker-shutdown"
 fi
 
+# --- Sudoers configuration (jobRunAsUser impersonation) -----------------------------
+# openjd-sessions runs a Session's actions as the queue's jobRunAsUser via
+# `sudo -u <job-user> -i ...`, so the agent user must be able to become a job user
+# WITHOUT a password. Its README states the requirement directly: "You must ensure that
+# the `host` user is able to run commands as the `actions` user with passwordless sudo".
+#
+# Linux does not need an explicit rule here only because the distro's stock sudoers
+# already grants sudo to the agent user's groups. On macOS the agent is a hidden
+# UID<500 service account that belongs to no admin group, so nothing grants it, and a
+# LaunchDaemon has no TTY for sudo to prompt on -- every impersonated action would fail
+# with "sudo: a terminal is required to read the password" and the job would retry
+# forever. The rule is therefore mandatory on macOS, not optional.
+#
+# Scoped to the job GROUP (%group runas syntax), not a single user: the queue chooses the
+# jobRunAsUser, which may be any member of the job group, and the installer does not know
+# which. This grants the agent user no new authority over root or over any account
+# outside the job group.
+echo "Setting up sudoers jobRunAsUser rule at /etc/sudoers.d/deadline-worker-job-users"
+mkdir -p /etc/sudoers.d
+cat > /etc/sudoers.d/deadline-worker-job-users <<EOF
+# Allow ${wa_user} to run a Session's actions as any user in the ${job_group} group.
+# Required by openjd-sessions' POSIX impersonation path (sudo -u <job-user> -i ...).
+${wa_user} ALL=(%${job_group}) NOPASSWD: ALL
+EOF
+chmod 440 /etc/sudoers.d/deadline-worker-job-users
+# A malformed sudoers file can break sudo host-wide, so validate before leaving it in
+# place and remove it rather than shipping something sudo will refuse to parse.
+if ! visudo -cf /etc/sudoers.d/deadline-worker-job-users; then
+    rm -f /etc/sudoers.d/deadline-worker-job-users
+    echo "ERROR: generated an invalid sudoers file; removed it." >&2
+    exit 1
+fi
+echo "Done setting up sudoers jobRunAsUser rule"
+
 # --- Directory provisioning (IDENTICAL to Linux: paths + modes are portable) --------
 echo "Provisioning log directory (/var/log/amazon/deadline)"
 mkdir -p /var/log/amazon/deadline
