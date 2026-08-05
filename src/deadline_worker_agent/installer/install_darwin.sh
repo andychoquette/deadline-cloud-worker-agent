@@ -449,17 +449,33 @@ fi
 # WITHOUT a password. Its README states the requirement directly: "You must ensure that
 # the `host` user is able to run commands as the `actions` user with passwordless sudo".
 #
-# Linux does not need an explicit rule here only because the distro's stock sudoers
-# already grants sudo to the agent user's groups. On macOS the agent is a hidden
-# UID<500 service account that belongs to no admin group, so nothing grants it, and a
-# LaunchDaemon has no TTY for sudo to prompt on -- every impersonated action would fail
-# with "sudo: a terminal is required to read the password" and the job would retry
-# forever. The rule is therefore mandatory on macOS, not optional.
+# WHICH QUEUE CONFIGURATIONS THIS AFFECTS: only jobRunAsUser -> runAs =
+# QUEUE_CONFIGURED_USER (and the agent's own `posix_job_user` config override), where
+# openjd-sessions takes its cross-user path. Under runAs = WORKER_AGENT_USER the agent
+# passes no user to openjd-sessions, `PosixSessionUser.is_process_user()` short-circuits
+# the `sudo` branch, and actions run as the agent user directly -- this rule is never
+# consulted. It is written unconditionally because the installer cannot know which
+# queues the fleet will be associated with, and association can change after install.
+#
+# Linux DOES need an equivalent rule; it is simply a documented manual step rather than
+# something install.sh automates. The Deadline Cloud developer guide has the operator
+# create it by hand (`deadline-worker-agent ALL=(jobRunAsUser) NOPASSWD:ALL`):
+#   https://docs.aws.amazon.com/deadline-cloud/latest/developerguide/worker-host.html
+# The macOS divergence is that the installer writes the rule for you, because here the
+# failure is both silent and fatal: the agent is a hidden UID<500 service account in no
+# admin group, and a LaunchDaemon has no TTY for sudo to prompt on, so every impersonated
+# action dies with "sudo: a terminal is required to read the password" and the task
+# retries forever (READY <-> ASSIGNED) with nothing on the host explaining why.
 #
 # Scoped to the job GROUP (%group runas syntax), not a single user: the queue chooses the
 # jobRunAsUser, which may be any member of the job group, and the installer does not know
 # which. This grants the agent user no new authority over root or over any account
-# outside the job group.
+# outside the job group. Note this is BROADER than the per-user rule the Linux docs
+# prescribe -- it covers any current or future member of ${job_group} -- which is the
+# price of not knowing the queue's user at install time. Treat job group membership as
+# the security boundary: adding a user to ${job_group} makes it impersonable by the
+# agent. The docs require each jobRunAsUser to be in this group and to stay out of the
+# agent's primary group, so group membership is already the intended boundary.
 echo "Setting up sudoers jobRunAsUser rule at /etc/sudoers.d/deadline-worker-job-users"
 mkdir -p /etc/sudoers.d
 cat > /etc/sudoers.d/deadline-worker-job-users <<EOF
