@@ -287,12 +287,24 @@ class TestInstall:
 
     def test_sudoers_job_user_rule_does_not_grant_root(self, installed) -> None:
         """The impersonation rule must not become a general root escalation for the
-        agent user: it is scoped to the job group's runas list only."""
+        agent user: it is scoped to the job group's runas list only.
+
+        Only the jobRunAsUser rule is examined here. The shutdown rule is a
+        deliberate, narrowly-scoped root grant gated behind --allow-shutdown; it is
+        covered by test_sudoers_grants_exactly_shutdown and (for its absence)
+        test_reinstall_without_allow_shutdown_revokes_sudoers."""
         content = sudo_output("cat", str(JOB_USERS_SUDOERS_PATH))
-        assert "ALL=(ALL)" not in content
-        assert "(root)" not in content
-        # Absent --allow-shutdown there is no root-granting rule at all.
-        assert not SUDOERS_PATH.exists() or "root" not in sudo_output("cat", str(SUDOERS_PATH))
+        # Exactly one rule, and it is the job-group-scoped one. A second rule -- or a
+        # widened runas list -- would hand the agent user authority the queue's
+        # jobRunAsUser model does not require.
+        rules = [
+            line.strip()
+            for line in content.splitlines()
+            if line.strip() and not line.strip().startswith("#")
+        ]
+        assert rules == [f"{WA_USER} ALL=(%{JOB_GROUP}) NOPASSWD: ALL"], (
+            f"unexpected rule contents: {content}"
+        )
 
     def test_sudoers_grants_exactly_shutdown(self, installed) -> None:
         assert sudo_output("stat", "-f", "%Lp %Su", str(SUDOERS_PATH)) == "440 root"
