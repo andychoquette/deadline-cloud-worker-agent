@@ -177,6 +177,31 @@ validate_deadline_id() {
     [[ "${input}" =~ ^$prefix-[a-f0-9]{32}$ ]]
 }
 
+# Install a file into /etc/sudoers.d only if sudo can parse it.
+# A malformed file in /etc/sudoers.d breaks sudo HOST-WIDE, not just for this agent, so every
+# file this installer writes there goes through here: write to a temporary location, validate,
+# and only then move it into place. Validating before the file is ever visible to sudo (rather
+# than writing it and removing it on failure) means a rejected file never exists at the real
+# path, so a concurrent sudo cannot observe the broken state.
+# Args: $1 = destination path under /etc/sudoers.d, $2 = file content.
+install_sudoers_file() {
+    local dest="$1" content="$2" tmp
+    tmp="$(mktemp)"
+    printf '%s' "${content}" > "${tmp}"
+    chmod 440 "${tmp}"
+    if ! visudo -cf "${tmp}" > /dev/null; then
+        rm -f "${tmp}"
+        echo "ERROR: generated an invalid sudoers file for ${dest}; not installing it." >&2
+        return 1
+    fi
+    # mv within the same filesystem is atomic; /etc/sudoers.d and mktemp's /var/folders are both
+    # on the root volume. Re-assert mode/owner after the move: mktemp created the file as root
+    # (the installer requires root) but be explicit rather than relying on it.
+    mv "${tmp}" "${dest}"
+    chown root:wheel "${dest}"
+    chmod 440 "${dest}"
+}
+
 # Validate arguments
 # macOS ships only BSD getopt, which does NOT support `--longoptions` -- it silently treats the
 # long option spec as positional args and drops every real flag, leaving values "unset". Rather
@@ -429,11 +454,13 @@ if [[ "${allow_shutdown}" == "yes" ]]; then
     echo "Setting up sudoers shutdown rule at /etc/sudoers.d/deadline-worker-shutdown"
     # /etc/sudoers.d exists and is included by default on macOS.
     mkdir -p /etc/sudoers.d
-    cat > /etc/sudoers.d/deadline-worker-shutdown <<EOF
-# Allow ${wa_user} user to shutdown the system
+    # Validated before being installed -- see install_sudoers_file. This file is written before
+    # the jobRunAsUser rule below, so validating it here keeps an unvalidated file from being
+    # left behind if a later step aborts the install.
+    install_sudoers_file /etc/sudoers.d/deadline-worker-shutdown \
+"# Allow ${wa_user} user to shutdown the system
 ${wa_user} ALL=(root) NOPASSWD: /sbin/shutdown -h now
-EOF
-    chmod 440 /etc/sudoers.d/deadline-worker-shutdown
+"
     echo "Done setting up sudoers shutdown rule"
 elif [ -f /etc/sudoers.d/deadline-worker-shutdown ]; then
     echo "Removing sudoers shutdown rule at /etc/sudoers.d/deadline-worker-shutdown"
@@ -478,19 +505,11 @@ fi
 # agent's primary group, so group membership is already the intended boundary.
 echo "Setting up sudoers jobRunAsUser rule at /etc/sudoers.d/deadline-worker-job-users"
 mkdir -p /etc/sudoers.d
-cat > /etc/sudoers.d/deadline-worker-job-users <<EOF
-# Allow ${wa_user} to run a Session's actions as any user in the ${job_group} group.
+install_sudoers_file /etc/sudoers.d/deadline-worker-job-users \
+"# Allow ${wa_user} to run a Session's actions as any user in the ${job_group} group.
 # Required by openjd-sessions' POSIX impersonation path (sudo -u <job-user> -i ...).
 ${wa_user} ALL=(%${job_group}) NOPASSWD: ALL
-EOF
-chmod 440 /etc/sudoers.d/deadline-worker-job-users
-# A malformed sudoers file can break sudo host-wide, so validate before leaving it in
-# place and remove it rather than shipping something sudo will refuse to parse.
-if ! visudo -cf /etc/sudoers.d/deadline-worker-job-users; then
-    rm -f /etc/sudoers.d/deadline-worker-job-users
-    echo "ERROR: generated an invalid sudoers file; removed it." >&2
-    exit 1
-fi
+"
 echo "Done setting up sudoers jobRunAsUser rule"
 
 # --- Directory provisioning (IDENTICAL to Linux: paths + modes are portable) --------

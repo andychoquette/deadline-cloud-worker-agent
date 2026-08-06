@@ -315,6 +315,16 @@ class TestInstall:
             rf"^{WA_USER} ALL=\(root\) NOPASSWD: /sbin/shutdown -h now$", content, re.MULTILINE
         )
 
+    @pytest.mark.parametrize("path", [SUDOERS_PATH, JOB_USERS_SUDOERS_PATH])
+    def test_every_sudoers_file_is_root_owned_and_parses(self, installed, path: Path) -> None:
+        """Both files this installer writes into /etc/sudoers.d go through the same
+        validate-then-install helper. A malformed file there breaks sudo host-wide, and a
+        non-root-owned or group-writable one is ignored by sudo outright, so assert both
+        properties for every file rather than only the jobRunAsUser one."""
+        assert path.exists(), f"installer did not create {path}"
+        assert sudo_output("stat", "-f", "%Lp %Su %Sg", str(path)) == "440 root wheel"
+        subprocess.run(["sudo", "visudo", "-cf", str(path)], check=True)
+
 
 class TestReinstall:
     """Behavior of running the installer again over an existing installation."""
