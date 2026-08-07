@@ -454,9 +454,9 @@ if [[ "${allow_shutdown}" == "yes" ]]; then
     echo "Setting up sudoers shutdown rule at /etc/sudoers.d/deadline-worker-shutdown"
     # /etc/sudoers.d exists and is included by default on macOS.
     mkdir -p /etc/sudoers.d
-    # Validated before being installed -- see install_sudoers_file. This file is written before
-    # the jobRunAsUser rule below, so validating it here keeps an unvalidated file from being
-    # left behind if a later step aborts the install.
+    # Validated before being installed -- see install_sudoers_file. A rejected file never
+    # appears at the real path, so a later step aborting the install cannot leave an
+    # unvalidated file behind in /etc/sudoers.d.
     install_sudoers_file /etc/sudoers.d/deadline-worker-shutdown \
 "# Allow ${wa_user} user to shutdown the system
 ${wa_user} ALL=(root) NOPASSWD: /sbin/shutdown -h now
@@ -469,48 +469,6 @@ elif [ -f /etc/sudoers.d/deadline-worker-shutdown ]; then
 else
     echo "No prior sudoers shutdown rule at /etc/sudoers.d/deadline-worker-shutdown"
 fi
-
-# --- Sudoers configuration (jobRunAsUser impersonation) -----------------------------
-# openjd-sessions runs a Session's actions as the queue's jobRunAsUser via
-# `sudo -u <job-user> -i ...`, so the agent user must be able to become a job user
-# WITHOUT a password. Its README states the requirement directly: "You must ensure that
-# the `host` user is able to run commands as the `actions` user with passwordless sudo".
-#
-# WHICH QUEUE CONFIGURATIONS THIS AFFECTS: only jobRunAsUser -> runAs =
-# QUEUE_CONFIGURED_USER (and the agent's own `posix_job_user` config override), where
-# openjd-sessions takes its cross-user path. Under runAs = WORKER_AGENT_USER the agent
-# passes no user to openjd-sessions, `PosixSessionUser.is_process_user()` short-circuits
-# the `sudo` branch, and actions run as the agent user directly -- this rule is never
-# consulted. It is written unconditionally because the installer cannot know which
-# queues the fleet will be associated with, and association can change after install.
-#
-# Linux DOES need an equivalent rule; it is simply a documented manual step rather than
-# something install.sh automates. The Deadline Cloud developer guide has the operator
-# create it by hand (`deadline-worker-agent ALL=(jobRunAsUser) NOPASSWD:ALL`):
-#   https://docs.aws.amazon.com/deadline-cloud/latest/developerguide/worker-host.html
-# The macOS divergence is that the installer writes the rule for you, because here the
-# failure is both silent and fatal: the agent is a hidden UID<500 service account in no
-# admin group, and a LaunchDaemon has no TTY for sudo to prompt on, so every impersonated
-# action dies with "sudo: a terminal is required to read the password" and the task
-# retries forever (READY <-> ASSIGNED) with nothing on the host explaining why.
-#
-# Scoped to the job GROUP (%group runas syntax), not a single user: the queue chooses the
-# jobRunAsUser, which may be any member of the job group, and the installer does not know
-# which. This grants the agent user no new authority over root or over any account
-# outside the job group. Note this is BROADER than the per-user rule the Linux docs
-# prescribe -- it covers any current or future member of ${job_group} -- which is the
-# price of not knowing the queue's user at install time. Treat job group membership as
-# the security boundary: adding a user to ${job_group} makes it impersonable by the
-# agent. The docs require each jobRunAsUser to be in this group and to stay out of the
-# agent's primary group, so group membership is already the intended boundary.
-echo "Setting up sudoers jobRunAsUser rule at /etc/sudoers.d/deadline-worker-job-users"
-mkdir -p /etc/sudoers.d
-install_sudoers_file /etc/sudoers.d/deadline-worker-job-users \
-"# Allow ${wa_user} to run a Session's actions as any user in the ${job_group} group.
-# Required by openjd-sessions' POSIX impersonation path (sudo -u <job-user> -i ...).
-${wa_user} ALL=(%${job_group}) NOPASSWD: ALL
-"
-echo "Done setting up sudoers jobRunAsUser rule"
 
 # --- Directory provisioning (IDENTICAL to Linux: paths + modes are portable) --------
 echo "Provisioning log directory (/var/log/amazon/deadline)"

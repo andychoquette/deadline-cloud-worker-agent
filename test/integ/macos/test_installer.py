@@ -42,7 +42,6 @@ JOB_GROUP = "deadline-job-users"
 LAUNCHD_LABEL = "com.amazon.deadline.worker-agent"
 PLIST_PATH = Path("/Library/LaunchDaemons") / f"{LAUNCHD_LABEL}.plist"
 SUDOERS_PATH = Path("/etc/sudoers.d/deadline-worker-shutdown")
-JOB_USERS_SUDOERS_PATH = Path("/etc/sudoers.d/deadline-worker-job-users")
 
 REPO_ROOT = Path(__file__).parent.parent.parent.parent
 INSTALLER = REPO_ROOT / "src" / "deadline_worker_agent" / "installer" / "install_darwin.sh"
@@ -266,47 +265,6 @@ class TestInstall:
         assert not service_is_registered()
         assert not agent_process_running()
 
-    def test_sudoers_grants_job_user_impersonation(self, installed) -> None:
-        """openjd-sessions runs a Session's actions as the queue's jobRunAsUser via
-        `sudo -u <job-user> -i ...`, which requires passwordless sudo. Unlike Linux,
-        where the distro's stock sudoers already covers the agent user, macOS grants
-        a hidden UID<500 service account nothing, and a LaunchDaemon has no TTY for
-        sudo to prompt on -- so without this rule every impersonated action fails
-        with "sudo: a terminal is required to read the password"."""
-        assert JOB_USERS_SUDOERS_PATH.exists(), (
-            "installer did not create the jobRunAsUser sudoers rule"
-        )
-        assert sudo_output("stat", "-f", "%Lp %Su", str(JOB_USERS_SUDOERS_PATH)) == "440 root"
-        # A malformed file here breaks sudo host-wide, so it must parse.
-        subprocess.run(["sudo", "visudo", "-cf", str(JOB_USERS_SUDOERS_PATH)], check=True)
-        content = sudo_output("cat", str(JOB_USERS_SUDOERS_PATH))
-        # Scoped to the job GROUP: the queue picks the jobRunAsUser, and the installer
-        # cannot know which member of the group that will be.
-        assert re.search(
-            rf"^{WA_USER} ALL=\(%{JOB_GROUP}\) NOPASSWD: ALL$", content, re.MULTILINE
-        ), f"unexpected rule contents: {content}"
-
-    def test_sudoers_job_user_rule_does_not_grant_root(self, installed) -> None:
-        """The impersonation rule must not become a general root escalation for the
-        agent user: it is scoped to the job group's runas list only.
-
-        Only the jobRunAsUser rule is examined here. The shutdown rule is a
-        deliberate, narrowly-scoped root grant gated behind --allow-shutdown; it is
-        covered by test_sudoers_grants_exactly_shutdown and (for its absence)
-        test_reinstall_without_allow_shutdown_revokes_sudoers."""
-        content = sudo_output("cat", str(JOB_USERS_SUDOERS_PATH))
-        # Exactly one rule, and it is the job-group-scoped one. A second rule -- or a
-        # widened runas list -- would hand the agent user authority the queue's
-        # jobRunAsUser model does not require.
-        rules = [
-            line.strip()
-            for line in content.splitlines()
-            if line.strip() and not line.strip().startswith("#")
-        ]
-        assert rules == [f"{WA_USER} ALL=(%{JOB_GROUP}) NOPASSWD: ALL"], (
-            f"unexpected rule contents: {content}"
-        )
-
     def test_sudoers_grants_exactly_shutdown(self, installed) -> None:
         assert sudo_output("stat", "-f", "%Lp %Su", str(SUDOERS_PATH)) == "440 root"
         # visudo validates the syntax
@@ -316,12 +274,16 @@ class TestInstall:
             rf"^{WA_USER} ALL=\(root\) NOPASSWD: /sbin/shutdown -h now$", content, re.MULTILINE
         )
 
-    @pytest.mark.parametrize("path", [SUDOERS_PATH, JOB_USERS_SUDOERS_PATH])
+    @pytest.mark.parametrize("path", [SUDOERS_PATH])
     def test_every_sudoers_file_is_root_owned_and_parses(self, installed, path: Path) -> None:
-        """Both files this installer writes into /etc/sudoers.d go through the same
+        """Every file this installer writes into /etc/sudoers.d goes through the same
         validate-then-install helper. A malformed file there breaks sudo host-wide, and a
         non-root-owned or group-writable one is ignored by sudo outright, so assert both
-        properties for every file rather than only the jobRunAsUser one."""
+        properties for each file the installer creates.
+
+        Parameterized over a single path today (the --allow-shutdown rule is the only
+        one) so that adding a second sudoers file picks up these checks by listing it
+        here rather than by writing a new test."""
         assert path.exists(), f"installer did not create {path}"
         assert sudo_output("stat", "-f", "%Lp %Su %Sg", str(path)) == "440 root wheel"
         subprocess.run(["sudo", "visudo", "-cf", str(path)], check=True)
