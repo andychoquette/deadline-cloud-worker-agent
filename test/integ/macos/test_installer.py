@@ -24,6 +24,7 @@ import os
 import plistlib
 import re
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
@@ -444,3 +445,85 @@ class TestReinstall:
                 capture_output=True,
             )
         assert not service_is_registered()
+
+
+class TestStartsOnBoot:
+    """The daemon must come back by itself after a reboot.
+
+    SCOPE: this covers the launchd half of "reboot and re-attach" only. A real
+    reboot cannot run on a GitHub macOS runner, and re-registering with the
+    Deadline service needs a live farm/fleet, which these tests deliberately do
+    not have (the ids are fakes). What is reproduced here is the mechanism a
+    reboot uses: at boot launchd loads every plist in /Library/LaunchDaemons and
+    starts the ones with RunAtLoad=true. `launchctl bootstrap system <plist>` is
+    that same load-and-start step, so a plist that starts under bootstrap from a
+    cold (unloaded) state is a plist that starts on boot.
+
+    End-to-end reboot + re-attach against a real fleet is tracked separately; it
+    needs an EC2 Mac dedicated host and macOS support in
+    deadline-cloud-test-fixtures.
+    """
+
+    def test_installed_plist_starts_the_daemon_from_cold(self, installed) -> None:
+        """Install without --start, then load the plist the way boot does.
+
+        This is the regression guard for the RunAtLoad/KeepAlive combination. If
+        RunAtLoad were false (or the plist were otherwise not boot-ready), the
+        install would leave a worker that never runs again after a restart --
+        which is what an operator experiences as "the host rebooted and the
+        worker never came back"."""
+        # GIVEN a config-only install (no --start) over an unloaded service, so
+        # nothing is running and only the on-disk plist can bring it back
+        run_installer()
+        assert not service_is_registered(), "test precondition: service must be unloaded"
+
+        plist = plistlib.loads(PLIST_PATH.read_bytes())
+        assert plist["RunAtLoad"] is True, (
+            "plist is not boot-ready: RunAtLoad must be true or the daemon will "
+            "not start after a reboot"
+        )
+
+        # WHEN launchd loads it, exactly as it does for /Library/LaunchDaemons at boot
+        try:
+            subprocess.run(
+                ["sudo", "launchctl", "bootstrap", "system", str(PLIST_PATH)],
+                capture_output=True,
+                check=True,
+            )
+
+            # THEN the service is registered and launchd actually spawned it.
+            # The agent cannot authenticate against the fake farm/fleet, so it
+            # exits and KeepAlive respawns it; poll for a PID rather than
+            # requiring one at an instant we might catch between restarts.
+            assert service_is_registered()
+            assert self._daemon_had_a_pid(), (
+                "launchd loaded the plist but never spawned the process; "
+                "RunAtLoad did not take effect"
+            )
+        finally:
+            subprocess.run(
+                ["sudo", "launchctl", "bootout", f"system/{LAUNCHD_LABEL}"],
+                capture_output=True,
+            )
+        assert not service_is_registered()
+
+    @staticmethod
+    def _daemon_had_a_pid(timeout_s: float = 20.0) -> bool:
+        """True if `launchctl print` ever reports a pid for the daemon.
+
+        A crash-looping job is only briefly resident, so sample repeatedly
+        instead of once. A "pid = N" line means launchd started the process,
+        which is the property under test; whether that process then exits on the
+        fake credentials is irrelevant here.
+        """
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            out = subprocess.run(
+                ["sudo", "launchctl", "print", f"system/{LAUNCHD_LABEL}"],
+                capture_output=True,
+                text=True,
+            ).stdout
+            if re.search(r"^\s*pid\s*=\s*\d+", out, re.MULTILINE):
+                return True
+            time.sleep(0.5)
+        return False
