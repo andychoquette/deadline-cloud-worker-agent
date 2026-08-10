@@ -3,7 +3,7 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 
 #
-# AWS Deadline Cloud Worker Agent Installer (macOS / darwin)
+# AWS Deadline Cloud Worker Agent Installer (macOS)
 #
 # This is the macOS port of install.sh. It mirrors the Linux installer's flag surface and
 # overall structure so the deadline_worker_agent.installer dispatcher can invoke it identically
@@ -65,7 +65,7 @@ worker_agent_homedir="/var/lib/deadline-worker"
 
 usage()
 {
-    echo "Usage: install_darwin.sh --farm-id FARM_ID"
+    echo "Usage: install_macos.sh --farm-id FARM_ID"
     echo "                  --fleet-id FLEET_ID"
     echo "                  --scripts-path SCRIPTS_PATH"
     echo "                  --python-interpreter-path PYTHON_INTERPRETER_PATH"
@@ -120,8 +120,8 @@ usage()
 
 banner() {
     echo "==========================================================="
-    echo "|      AWS Deadline Cloud Worker Agent Installer       |"
-    echo "|                    (macOS / darwin)                     |"
+    echo "|        AWS Deadline Cloud Worker Agent Installer        |"
+    echo "|                         (macOS)                         |"
     echo "==========================================================="
 }
 
@@ -147,16 +147,20 @@ user_primary_group_name() {
     fi
 }
 
-# Allocate the highest unused ID in [200,500) from a dscl attribute listing.
+# Returns the highest unused ID in [200,500) from a dscl attribute listing.
+#
+# This only FINDS an unused id; it does not reserve one. The caller creates the record, so the
+# id is unclaimed between this returning and that write. That is not race-safe against
+# concurrent account creation, which matches the Linux installer's useradd behavior under the
+# same (root, single-installer) assumption.
+#
 # NOTE: macOS reserves IDs < 500 for hidden/system accounts. Combined with IsHidden=1 this keeps
-#       the agent account out of the login window. The allocator scans the live directory
+#       the agent account out of the login window. The search scans the live directory
 #       (dscl -list) at install time, so IDs already taken on the image -- including by
 #       MDM-provisioned accounts -- are skipped; searching downward from 499 also stays clear of
 #       Apple's own low-numbered system accounts. The install must fail if the range is
 #       exhausted rather than pick a UID >= 500 (which would appear in the login window).
-# NOTE: not race-safe against concurrent account creation, matching the Linux installer's
-#       useradd behavior under the same (root, single-installer) assumption.
-allocate_system_id() {
+find_unused_system_id() {
     local kind="$1"   # "Users" or "Groups"
     local attr="$2"   # "UniqueID" or "PrimaryGroupID"
     local used candidate
@@ -167,7 +171,7 @@ allocate_system_id() {
             return 0
         fi
     done
-    echo "ERROR: Could not allocate a free system ${attr} in range [200,500)." >&2
+    echo "ERROR: Could not find an unused system ${attr} in range [200,500)." >&2
     return 1
 }
 
@@ -295,7 +299,7 @@ fi
 # --- VFS is not supported on macOS: fail loudly -------------------------------------
 # DESIGN CHOICE: hard error (exit non-zero) rather than a silent warning, so that a mistaken
 # VFS request surfaces immediately instead of producing a silently-degraded install. The
-# dispatcher (__init__.py) also rejects --vfs-install-path on darwin before we ever get here;
+# dispatcher (__init__.py) also rejects --vfs-install-path on macOS before we ever get here;
 # this is defense-in-depth for direct script invocation.
 if [[ "${vfs_install_path}" != "unset" ]]; then
     echo "ERROR: The Deadline Virtual File System (VFS) is not supported on macOS."
@@ -376,7 +380,7 @@ if ! user_exists "${wa_user}"; then
     # First ensure the user's DEDICATED primary group exists (named after the user).
     # This group -- NOT the job group -- becomes the user's PrimaryGroupID (security invariant).
     if ! group_exists "${wa_user}"; then
-        wa_primary_gid=$(allocate_system_id Groups PrimaryGroupID)
+        wa_primary_gid=$(find_unused_system_id Groups PrimaryGroupID)
         dscl . -create /Groups/"${wa_user}"
         dscl . -create /Groups/"${wa_user}" PrimaryGroupID "${wa_primary_gid}"
         dscl . -create /Groups/"${wa_user}" RealName "${wa_user}"
@@ -384,7 +388,7 @@ if ! user_exists "${wa_user}"; then
         wa_primary_gid=$(dscl . -read /Groups/"${wa_user}" PrimaryGroupID 2>/dev/null | awk '{print $2}')
     fi
 
-    wa_uid=$(allocate_system_id Users UniqueID)
+    wa_uid=$(find_unused_system_id Users UniqueID)
     dscl . -create /Users/"${wa_user}"
     dscl . -create /Users/"${wa_user}" UniqueID "${wa_uid}"
     dscl . -create /Users/"${wa_user}" PrimaryGroupID "${wa_primary_gid}"
@@ -447,7 +451,7 @@ fi
 # --- Sudoers configuration (--allow-shutdown) ---------------------------------------
 # macOS shutdown binary lives at /sbin/shutdown (BSD shutdown). The Linux line used
 # `/usr/sbin/shutdown now`; the BSD invocation is `/sbin/shutdown -h now` (-h = halt/power off).
-# The agent invokes `sudo shutdown -h now` on darwin (startup/entrypoint.py:_host_shutdown);
+# The agent invokes `sudo shutdown -h now` on macOS (startup/entrypoint.py:_host_shutdown);
 # sudo resolves `shutdown` to /sbin/shutdown via PATH and matches this rule by full path.
 # The sudoers command MUST continue to match that argv exactly for the NOPASSWD rule to apply.
 if [[ "${allow_shutdown}" == "yes" ]]; then

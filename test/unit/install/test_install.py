@@ -341,7 +341,7 @@ class TestMacOSInstall:
         # THEN
         assert (
             installer_mod.INSTALLER_PATH["darwin"]
-            == Path(installer_mod.__file__).parent / "install_darwin.sh"
+            == Path(installer_mod.__file__).parent / "install_macos.sh"
         )
 
     def test_runs_expected_subprocess_on_darwin(

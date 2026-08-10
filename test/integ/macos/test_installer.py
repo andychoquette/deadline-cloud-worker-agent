@@ -1,6 +1,6 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 
-"""Integration tests for install_darwin.sh.
+"""Integration tests for install_macos.sh.
 
 These tests run the macOS installer for real (via sudo) and assert the
 invariants it must establish. They mutate host state -- users, groups,
@@ -44,7 +44,7 @@ PLIST_PATH = Path("/Library/LaunchDaemons") / f"{LAUNCHD_LABEL}.plist"
 SUDOERS_PATH = Path("/etc/sudoers.d/deadline-worker-shutdown")
 
 REPO_ROOT = Path(__file__).parent.parent.parent.parent
-INSTALLER = REPO_ROOT / "src" / "deadline_worker_agent" / "installer" / "install_darwin.sh"
+INSTALLER = REPO_ROOT / "src" / "deadline_worker_agent" / "installer" / "install_macos.sh"
 
 pytestmark = pytest.mark.skipif(
     os.environ.get("RUN_INSTALLER_TESTS", "").lower() != "true",
@@ -56,7 +56,7 @@ pytestmark = pytest.mark.skipif(
 
 
 def run_installer(*extra_args: str, check: bool = True) -> subprocess.CompletedProcess:
-    """Runs install_darwin.sh via sudo with the standard test arguments."""
+    """Runs install_macos.sh via sudo with the standard test arguments."""
     venv_bin = Path(os.environ["WA_VENV_BIN"])
     cmd = [
         "sudo",

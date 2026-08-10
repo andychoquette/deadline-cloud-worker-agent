@@ -34,7 +34,7 @@ from e2e.utils import (
 
 LOG = logging.getLogger(__name__)
 
-# launchd service label installed by installer/install_darwin.sh on macOS workers.
+# launchd service label installed by installer/install_macos.sh on macOS workers.
 MACOS_LAUNCHD_LABEL = "com.amazon.deadline.worker-agent"
 
 

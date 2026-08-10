@@ -26,7 +26,7 @@ if sys.platform == "win32":
 
 INSTALLER_PATH = {
     "linux": Path(__file__).parent / "install.sh",
-    "darwin": Path(__file__).parent / "install_darwin.sh",
+    "darwin": Path(__file__).parent / "install_macos.sh",
 }
 
 
@@ -81,7 +81,7 @@ def install() -> None:
     scripts_path = Path(sysconfig.get_path("scripts"))
 
     # The Deadline Virtual File System (VFS) is not supported on macOS. Reject the option here
-    # so the error surfaces before we shell out to install_darwin.sh (which also rejects it).
+    # so the error surfaces before we shell out to install_macos.sh (which also rejects it).
     if sys.platform == "darwin" and args.vfs_install_path:
         print("ERROR: --vfs-install-path is not supported on macOS.")
         sys.exit(1)
