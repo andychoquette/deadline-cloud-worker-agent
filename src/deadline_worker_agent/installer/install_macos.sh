@@ -161,17 +161,21 @@ user_primary_group_name() {
 #       Apple's own low-numbered system accounts. The install must fail if the range is
 #       exhausted rather than pick a UID >= 500 (which would appear in the login window).
 find_unused_system_id() {
-    local kind="$1"   # "Users" or "Groups"
-    local attr="$2"   # "UniqueID" or "PrimaryGroupID"
     local used candidate
-    used=$(dscl . -list /"${kind}" "${attr}" 2>/dev/null | awk '{print $2}' | sort -n)
+    # Union of BOTH namespaces. Searching only one lets the group and the user land on the
+    # same number: on a stock image 499 is free as a UID and as a GID, so the first install
+    # would take gid=499 and then uid=499. A shared number between two unrelated principals
+    # is ambiguous for getpwuid/getgrgid round-trips and makes the account harder to audit.
+    # Callers pass no arguments: both want "an id unused by any principal".
+    used=$( { dscl . -list /Users UniqueID; dscl . -list /Groups PrimaryGroupID; } 2>/dev/null \
+        | awk '{print $2}' | sort -n -u)
     for candidate in $(seq 499 -1 200); do
         if ! grep -qx "${candidate}" <<< "${used}"; then
             echo "${candidate}"
             return 0
         fi
     done
-    echo "ERROR: Could not find an unused system ${attr} in range [200,500)." >&2
+    echo "ERROR: Could not find an unused system UID/GID in range [200,500)." >&2
     return 1
 }
 
@@ -312,15 +316,52 @@ fi
 # group is a SECONDARY membership only (see below). If the user already exists we read its current
 # primary group; if we are creating the user we will give it a dedicated primary group named after
 # the user (never the job group).
+# SECOND INVARIANT, macOS-specific: wa_group must not be a broadly-shared group. It is used
+# as the group owner of the config directory (worker.toml, mode 640) and the agent's logs, so
+# every member of it can read them. On Linux `useradd` guarantees a dedicated single-member
+# primary group, which is why install.sh can reuse the primary group safely. On macOS the
+# primary group of any normal account -- including Setup Assistant and MDM-created ones -- is
+# `staff` (GID 20), which contains every local user on the host. Reusing that would publish
+# worker.toml and the logs to all of them.
+broad_groups=(staff admin everyone wheel _unknown nogroup)
+is_broad_group() {
+    local candidate="$1" g
+    for g in "${broad_groups[@]}"; do
+        [[ "${candidate}" == "${g}" ]] && return 0
+    done
+    return 1
+}
+
 if user_exists "${wa_user}"; then
     wa_group=$(user_primary_group_name "${wa_user}")
     if [[ -z "${wa_group}" ]]; then
         # Fall back to the user name if the primary group name could not be resolved.
         wa_group="${wa_user}"
+    elif is_broad_group "${wa_group}"; then
+        echo "ERROR: The primary group of --user ${wa_user} is ${wa_group}, which is shared by"
+        echo "       other users on this host. The worker agent's configuration and logs are"
+        echo "       group-owned by this group, so using it would make them readable by every"
+        echo "       member of ${wa_group}."
+        echo "       Use --user with a dedicated service account whose primary group has no"
+        echo "       other members, or omit --user to let the installer create one."
+        exit 1
     fi
 else
     # Newly created user -> its dedicated primary group has the same name as the user.
     wa_group="${wa_user}"
+fi
+
+# An existing account already has a home directory recorded in NFSHomeDirectory, and launchd
+# derives the daemon's HOME from that record -- not from the plist's WorkingDirectory. Adopt it
+# rather than provisioning the default path: otherwise HOME and the CWD point at two different
+# directories, anything resolving ~ (botocore's ~/.aws config and caches, for instance) lands
+# somewhere the installer never created or chowned, and the directory we did provision goes
+# unused.
+if user_exists "${wa_user}"; then
+    existing_homedir=$(dscl . -read /Users/"${wa_user}" NFSHomeDirectory 2>/dev/null | awk '{print $2}')
+    if [[ -n "${existing_homedir}" ]]; then
+        worker_agent_homedir="${existing_homedir}"
+    fi
 fi
 
 # Default the job group if not provided via --group.
@@ -380,7 +421,7 @@ if ! user_exists "${wa_user}"; then
     # First ensure the user's DEDICATED primary group exists (named after the user).
     # This group -- NOT the job group -- becomes the user's PrimaryGroupID (security invariant).
     if ! group_exists "${wa_user}"; then
-        wa_primary_gid=$(find_unused_system_id Groups PrimaryGroupID)
+        wa_primary_gid=$(find_unused_system_id)
         dscl . -create /Groups/"${wa_user}"
         dscl . -create /Groups/"${wa_user}" PrimaryGroupID "${wa_primary_gid}"
         dscl . -create /Groups/"${wa_user}" RealName "${wa_user}"
@@ -388,7 +429,7 @@ if ! user_exists "${wa_user}"; then
         wa_primary_gid=$(dscl . -read /Groups/"${wa_user}" PrimaryGroupID 2>/dev/null | awk '{print $2}')
     fi
 
-    wa_uid=$(find_unused_system_id Users UniqueID)
+    wa_uid=$(find_unused_system_id)
     dscl . -create /Users/"${wa_user}"
     dscl . -create /Users/"${wa_user}" UniqueID "${wa_uid}"
     dscl . -create /Users/"${wa_user}" PrimaryGroupID "${wa_primary_gid}"
@@ -398,10 +439,19 @@ if ! user_exists "${wa_user}"; then
     dscl . -create /Users/"${wa_user}" RealName "AWS Deadline Cloud Worker Agent"
     # IsHidden=1 keeps a UID<500 account out of the login window / user pickers.
     dscl . -create /Users/"${wa_user}" IsHidden 1
-    # Disable password auth entirely for this service account. '*' matches the
-    # /etc/master.passwd disabled-account convention; because the account is created without an
-    # AuthenticationAuthority attribute, Directory Services rejects authentication attempts
-    # outright (eDSAuthMethodNotSupported) rather than comparing against a password.
+    # No usable password for this service account. Password '*' with no
+    # AuthenticationAuthority is the shape Apple's own service accounts have -- `dscl . -read
+    # /Users/daemon` shows exactly "Password: *" and "UserShell: /usr/bin/false" with no
+    # AuthenticationAuthority -- so this follows the platform convention rather than inventing
+    # one.
+    #
+    # Deliberately not claiming more than that: what Directory Services does with a non-hash
+    # sentinel in that attribute is not documented, and it is the absence of an
+    # AuthenticationAuthority plus UserShell=/usr/bin/false and IsHidden=1 that actually keeps
+    # this account out of interactive use, not the '*' by itself. The explicit alternatives
+    # (AuthenticationAuthority ';DisabledUser;' or `pwpolicy -disableuser`) describe a
+    # *disabled* account, which is a different thing from one that never had credentials, and
+    # they add a second mechanism to keep working across releases for no clear gain here.
     dscl . -create /Users/"${wa_user}" Password '*'
 
     wa_group="${wa_user}"
