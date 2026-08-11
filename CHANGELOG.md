@@ -1,3 +1,15 @@
+## 0.31.0 (2026-08-10)
+
+### Features
+* Rust session runtime adapter: sessions can run on the OpenJD v1 Rust runtime as an alternative to the Python runtime. Select it by setting `session_runtime` in worker.toml to `python`, `rust`, or `service-selected`. (#1002)
+* With `service-selected`, the session runtime (Python or Rust) is chosen from a `runtimeHint` provided by the service, defaulting to Python when no hint is given. (#1009, #1016)
+* Runtime selection and failure telemetry events added. To opt out, set `opt_out = true` under `[telemetry]` in worker.toml, pass `--telemetry-opt-out` to the installer, or set the `DEADLINE_CLOUD_TELEMETRY_OPT_OUT=true` environment variable. (#1021)
+
+### Bug Fixes
+* Wrap-environment jobs failed on both the Python and Rust runtimes because `step_name` wasn't forwarded, leaving RFC 0008's `WrappedStep.Name` unresolved; both runtime paths now forward it. (#1039, #1040)
+* Rust runtime panics no longer silently kill the session thread; they are now reported as a failed session with proper cleanup and telemetry. (#1026)
+* Transient network errors (connection closed, connect/read timeout, endpoint connection) are now retried with exponential backoff instead of terminating the agent. (#1013)
+* Credentials expiring mid-call during hibernate/sleep no longer cause an unrecoverable exit; the agent now detects the time jump and retries with bootstrap credentials. (#1014)
 ## 0.30.2 (2026-07-14)
 
 ### Features
