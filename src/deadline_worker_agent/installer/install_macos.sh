@@ -167,8 +167,12 @@ find_unused_system_id() {
     # would take gid=499 and then uid=499. A shared number between two unrelated principals
     # is ambiguous for getpwuid/getgrgid round-trips and makes the account harder to audit.
     # Callers pass no arguments: both want "an id unused by any principal".
+    # $NF, not $2: `dscl . -list` prints "name<padding>id", so a record name containing a
+    # space makes $2 a fragment of the NAME. That id would then be missing from the used set
+    # and could be handed out again, producing a duplicate-UID install rather than a clean
+    # failure. The id is always the last field.
     used=$( { dscl . -list /Users UniqueID; dscl . -list /Groups PrimaryGroupID; } 2>/dev/null \
-        | awk '{print $2}' | sort -n -u)
+        | awk 'NF>1 {print $NF}' | sort -n -u)
     for candidate in $(seq 499 -1 200); do
         if ! grep -qx "${candidate}" <<< "${used}"; then
             echo "${candidate}"
@@ -358,7 +362,12 @@ fi
 # somewhere the installer never created or chowned, and the directory we did provision goes
 # unused.
 if user_exists "${wa_user}"; then
-    existing_homedir=$(dscl . -read /Users/"${wa_user}" NFSHomeDirectory 2>/dev/null | awk '{print $2}')
+    # sed, not awk '{print $2}': a home directory may contain spaces, and $2 would truncate
+    # "/Users/Deadline Worker" to "/Users/Deadline" -- a different, probably nonexistent path
+    # that would then be provisioned and written into the plist while the real HOME stayed
+    # elsewhere. Failing silently that way is worse than not adopting the value at all.
+    existing_homedir=$(dscl . -read /Users/"${wa_user}" NFSHomeDirectory 2>/dev/null \
+        | sed -n 's/^NFSHomeDirectory: //p')
     if [[ -n "${existing_homedir}" ]]; then
         worker_agent_homedir="${existing_homedir}"
     fi
@@ -461,12 +470,37 @@ else
 fi
 
 # --- Create the home directory (macOS does not auto-create it) ----------------------
-if [[ ! -d "${worker_agent_homedir}" ]]; then
+# Only provision a directory this installer creates. When --user names a pre-existing account,
+# worker_agent_homedir came from its NFSHomeDirectory, which for a service account is
+# conventionally a SHARED system path: most of Apple's own _-prefixed accounts record
+# /var/empty (root:wheel 0555, also sshd's privsep chroot), and `daemon` records /var/root.
+# chown-ing one of those to the agent user and narrowing it to 750 is a host-wide change well
+# outside this installer's remit. Some service accounts also use /dev/null, where the old
+# `[[ ! -d ]]` test passes and `mkdir -p` then fails with "File exists", aborting the install
+# under set -e with an opaque error.
+if [[ -e "${worker_agent_homedir}" && ! -d "${worker_agent_homedir}" ]]; then
+    warning_lines+=(
+        "The home directory of ${wa_user} (${worker_agent_homedir}) is not a directory."
+        "Leaving it alone. The agent's HOME will not be writable, which may break anything"
+        "that resolves ~ (for example a botocore credentials cache)."
+    )
+elif [[ ! -d "${worker_agent_homedir}" ]]; then
     echo "Creating worker agent home directory (${worker_agent_homedir})"
     mkdir -p "${worker_agent_homedir}"
+    chown "${wa_user}:${wa_group}" "${worker_agent_homedir}"
+    chmod 750 "${worker_agent_homedir}"
+elif [[ "$(stat -f %Su "${worker_agent_homedir}")" == "${wa_user}" ]]; then
+    # Already ours (a re-install): safe to re-assert ownership and mode.
+    chown "${wa_user}:${wa_group}" "${worker_agent_homedir}"
+    chmod 750 "${worker_agent_homedir}"
+else
+    warning_lines+=(
+        "The home directory of ${wa_user} (${worker_agent_homedir}) already exists and is"
+        "owned by $(stat -f %Su "${worker_agent_homedir}"), not ${wa_user}. Leaving its"
+        "ownership and permissions unchanged rather than taking over a directory this"
+        "installer did not create."
+    )
 fi
-chown "${wa_user}:${wa_group}" "${worker_agent_homedir}"
-chmod 750 "${worker_agent_homedir}"
 
 # --- Create the job group -----------------------------------------------------------
 # dseditgroup allocates a system GID and creates the group record. Idempotent via group_exists.
@@ -622,6 +656,12 @@ if ! [[ "${no_install_service}" == "yes" ]]; then
         printf '%s' "${s}"
     }
     prog_args_xml="        <string>$(xml_escape "${worker_agent_program}")</string>"$'\n'
+    # WorkingDirectory takes the same class of value as ProgramArguments and needs the same
+    # escaping. Since the NFSHomeDirectory adoption above it is read from a Directory Services
+    # record rather than being a hard-coded constant, so a home directory containing & < or >
+    # would produce a plist that is not well-formed XML -- which launchd rejects with an
+    # opaque error, or silently ignores until the next boot when --start was not passed.
+    working_directory_xml="$(xml_escape "${worker_agent_homedir}")"
 
     # launchd has no separate "start on boot" and "start on load" controls: RunAtLoad governs
     # both, and loading happens at every boot for /Library/LaunchDaemons plists as well as at
@@ -656,7 +696,7 @@ if ! [[ "${no_install_service}" == "yes" ]]; then
     <key>UserName</key>
     <string>${wa_user}</string>
     <key>WorkingDirectory</key>
-    <string>${worker_agent_homedir}</string>
+    <string>${working_directory_xml}</string>
     <key>ProgramArguments</key>
     <array>
 ${prog_args_xml}    </array>
