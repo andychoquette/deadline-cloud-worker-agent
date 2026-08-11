@@ -138,10 +138,24 @@ group_exists() {
     dscl . -read /Groups/"$1" &> /dev/null
 }
 
+# Read a single-valued attribute from a Directory Services record.
+#
+# `dscl -read` has two output shapes and the value's content decides which: a value with no
+# whitespace is printed inline ("NFSHomeDirectory: /var/empty"), while one containing spaces
+# is printed on an indented CONTINUATION line under a bare "NFSHomeDirectory:" header. Any
+# `awk '{print $2}'` or `sed 's/^Key: //'` parse therefore handles one shape and silently
+# returns the wrong thing (or nothing) for the other. Ask for a plist and extract the value
+# structurally instead, which is unambiguous for both.
+dscl_read_value() {
+    local record="$1" attr="$2"
+    dscl -plist . -read "${record}" "${attr}" 2>/dev/null \
+        | plutil -extract "dsAttrTypeStandard:${attr}.0" raw - 2>/dev/null || true
+}
+
 # Primary group NAME of a user (Linux `id -gn` equivalent). Resolves PrimaryGroupID -> group name.
 user_primary_group_name() {
     local u="$1" gid
-    gid=$(dscl . -read /Users/"$u" PrimaryGroupID 2>/dev/null | awk '{print $2}')
+    gid=$(dscl_read_value /Users/"$u" PrimaryGroupID)
     if [[ -n "${gid}" ]]; then
         dscl . -search /Groups PrimaryGroupID "${gid}" 2>/dev/null | awk 'NR==1{print $1}'
     fi
@@ -341,18 +355,25 @@ if user_exists "${wa_user}"; then
     if [[ -z "${wa_group}" ]]; then
         # Fall back to the user name if the primary group name could not be resolved.
         wa_group="${wa_user}"
-    elif is_broad_group "${wa_group}"; then
-        echo "ERROR: The primary group of --user ${wa_user} is ${wa_group}, which is shared by"
-        echo "       other users on this host. The worker agent's configuration and logs are"
-        echo "       group-owned by this group, so using it would make them readable by every"
-        echo "       member of ${wa_group}."
-        echo "       Use --user with a dedicated service account whose primary group has no"
-        echo "       other members, or omit --user to let the installer create one."
-        exit 1
     fi
 else
     # Newly created user -> its dedicated primary group has the same name as the user.
     wa_group="${wa_user}"
+fi
+
+# Checked on the RESOLVED wa_group, outside the branches above, so both paths are covered.
+# Gating this on user_exists would miss `--user staff`: the account does not exist, so
+# wa_group becomes "staff", and the group-creation block below then adopts the existing
+# `staff` record (GID 20) as the new account's primary group -- the same exposure by a
+# different route.
+if is_broad_group "${wa_group}"; then
+    echo "ERROR: ${wa_group} would be the worker agent user's primary group, and it is shared"
+    echo "       by other users on this host. The agent's configuration and logs are"
+    echo "       group-owned by that group, so this would make them readable by every one of"
+    echo "       its members."
+    echo "       Use --user with a dedicated service account whose primary group has no other"
+    echo "       members, or omit --user to let the installer create one."
+    exit 1
 fi
 
 # An existing account already has a home directory recorded in NFSHomeDirectory, and launchd
@@ -362,12 +383,12 @@ fi
 # somewhere the installer never created or chowned, and the directory we did provision goes
 # unused.
 if user_exists "${wa_user}"; then
-    # sed, not awk '{print $2}': a home directory may contain spaces, and $2 would truncate
-    # "/Users/Deadline Worker" to "/Users/Deadline" -- a different, probably nonexistent path
-    # that would then be provisioned and written into the plist while the real HOME stayed
-    # elsewhere. Failing silently that way is worse than not adopting the value at all.
-    existing_homedir=$(dscl . -read /Users/"${wa_user}" NFSHomeDirectory 2>/dev/null \
-        | sed -n 's/^NFSHomeDirectory: //p')
+    # Read via dscl_read_value: a home directory containing spaces is printed by `dscl -read`
+    # on a continuation line rather than inline, so both a field-split and a "^Key: " sed parse
+    # come back empty for exactly the case that matters. Silently falling back to the default
+    # would provision and chown a directory that is not the account's home while launchd still
+    # took HOME from the record.
+    existing_homedir=$(dscl_read_value /Users/"${wa_user}" NFSHomeDirectory)
     if [[ -n "${existing_homedir}" ]]; then
         worker_agent_homedir="${existing_homedir}"
     fi
@@ -378,6 +399,20 @@ job_group=${job_group:-${default_job_group}}
 if [[ ! -z "${job_group}" ]] && [[ ! "${job_group}" =~ ^[a-z_]([a-z0-9_-]{0,31}|[a-z0-9_-]{0,30}\$)$ ]]; then
     echo "ERROR: Not a valid value for --group: ${job_group}"
     usage
+fi
+
+# Same broad-group check as wa_group, for the same reason. job_group owns the persistence tree
+# (0750) and the session root (0755), and those modes are deliberately loosened so job users
+# can reach them -- so a shared group here is worse, not better: `--group staff` would let any
+# local user list queues/ and traverse into session directories to read job attachment inputs
+# and generated scripts. (credentials/ stays 0700, so AWS credentials remain protected.)
+# Syntax validation above does not catch this; `staff` is a perfectly well-formed group name.
+if is_broad_group "${job_group}"; then
+    echo "ERROR: --group ${job_group} is shared by other users on this host. The worker agent's"
+    echo "       persistence and session directories are group-owned by it, so this would give"
+    echo "       every member of ${job_group} access to job data."
+    echo "       Use a dedicated job group, or omit --group to use ${default_job_group}."
+    exit 1
 fi
 
 banner
@@ -435,7 +470,13 @@ if ! user_exists "${wa_user}"; then
         dscl . -create /Groups/"${wa_user}" PrimaryGroupID "${wa_primary_gid}"
         dscl . -create /Groups/"${wa_user}" RealName "${wa_user}"
     else
-        wa_primary_gid=$(dscl . -read /Groups/"${wa_user}" PrimaryGroupID 2>/dev/null | awk '{print $2}')
+        wa_primary_gid=$(dscl_read_value /Groups/"${wa_user}" PrimaryGroupID)
+        if [[ -z "${wa_primary_gid}" ]]; then
+            # Otherwise the `dscl -create ... PrimaryGroupID ""` below would write an empty
+            # value instead of failing with something an operator can act on.
+            echo "ERROR: group ${wa_user} exists but has no PrimaryGroupID." >&2
+            exit 1
+        fi
     fi
 
     wa_uid=$(find_unused_system_id)
@@ -481,8 +522,10 @@ fi
 if [[ -e "${worker_agent_homedir}" && ! -d "${worker_agent_homedir}" ]]; then
     warning_lines+=(
         "The home directory of ${wa_user} (${worker_agent_homedir}) is not a directory."
-        "Leaving it alone. The agent's HOME will not be writable, which may break anything"
-        "that resolves ~ (for example a botocore credentials cache)."
+        "Leaving it alone. HOME will point at it regardless, since launchd takes HOME from"
+        "the account record, so anything resolving ~ (a botocore credentials cache, for"
+        "example) will fail. The service's WorkingDirectory falls back to a real directory"
+        "so the agent still starts."
     )
 elif [[ ! -d "${worker_agent_homedir}" ]]; then
     echo "Creating worker agent home directory (${worker_agent_homedir})"
@@ -584,6 +627,16 @@ if [ -f /var/lib/deadline/worker.json ]; then
 fi
 echo "Done provisioning persistence directory (/var/lib/deadline)"
 
+# DIVERGENCE FROM LINUX, deliberate: the default session root is nested under
+# /var/lib/deadline (0750 wa_user:job_group), whereas Linux's /sessions is top-level under /
+# (0755). Traversing into a session directory here therefore requires membership in
+# ${job_group}, which the 0755 on the session root itself cannot grant -- the search bit is
+# missing one level up. That matches the documented model, where every jobRunAsUser is a member
+# of the shared job group, and it is deliberately tighter than Linux: a job user outside the
+# group cannot reach other queues' session directories. A jobRunAsUser that is NOT in
+# ${job_group} will get EACCES on its own session path, which is a misconfiguration the
+# worker-host documentation needs to state (macOS cannot put this at / because the root volume
+# is sealed read-only).
 echo "Provisioning root directory for OpenJD Sessions (${session_root_dir})"
 mkdir -p "${session_root_dir}"
 chown "${wa_user}:${job_group}" "${session_root_dir}"
@@ -661,7 +714,23 @@ if ! [[ "${no_install_service}" == "yes" ]]; then
     # record rather than being a hard-coded constant, so a home directory containing & < or >
     # would produce a plist that is not well-formed XML -- which launchd rejects with an
     # opaque error, or silently ignores until the next boot when --start was not passed.
-    working_directory_xml="$(xml_escape "${worker_agent_homedir}")"
+    # launchd chdir()s into WorkingDirectory before exec, so an unusable value is fatal rather
+    # than cosmetic: the spawn fails with ENOTDIR and KeepAlive throttles the retry, leaving a
+    # service that never runs and reports only a nonzero last exit status. worker_agent_homedir
+    # can be such a path -- an adopted NFSHomeDirectory of /dev/null, for instance, which the
+    # provisioning block above deliberately leaves alone. Fall back to a directory this
+    # installer definitely created so the daemon still starts.
+    working_directory="${worker_agent_homedir}"
+    if [[ ! -d "${working_directory}" ]]; then
+        working_directory=/var/lib/deadline
+        warning_lines+=(
+            "The home directory of ${wa_user} (${worker_agent_homedir}) is not a usable"
+            "directory, so the service's WorkingDirectory was set to ${working_directory}"
+            "instead. HOME still comes from the account record, so anything resolving ~ will"
+            "not work until that directory exists."
+        )
+    fi
+    working_directory_xml="$(xml_escape "${working_directory}")"
 
     # launchd has no separate "start on boot" and "start on load" controls: RunAtLoad governs
     # both, and loading happens at every boot for /Library/LaunchDaemons plists as well as at
