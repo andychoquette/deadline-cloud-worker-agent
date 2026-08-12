@@ -615,10 +615,13 @@ def operating_system() -> OperatingSystem:
     elif os_env_var == "windows":
         return OperatingSystem(name="WIN2022")
     elif os_env_var == "macos":
-        # NOTE: requires a deadline-cloud-test-fixtures release whose
-        # OperatingSystem/worker fixtures accept a macOS platform (EC2 Mac
-        # dedicated hosts). The test-suite plumbing here is ready ahead of that.
-        return OperatingSystem(name="MACOS")
+        # deadline-cloud-test-fixtures types this as Literal["AL2023", "WIN2022"], so mypy
+        # rejects "MACOS" until that package gains macOS support (it also needs a
+        # MacInstanceWorker: the posix worker hardcodes an AL2023 AMI and provisions with
+        # useradd/groupadd). Nothing sets OPERATING_SYSTEM=macos in CI yet, so this branch is
+        # unreachable today and kept only so the plumbing is in place; the ignore comes off
+        # with that release.
+        return OperatingSystem(name="MACOS")  # type: ignore[arg-type]
     else:
         assert False, (
             f'Expected OPERATING_SYSTEM env var to be "linux", "windows", or "macos", '

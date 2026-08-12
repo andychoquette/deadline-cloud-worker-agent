@@ -529,6 +529,10 @@ class TestRustUnavailableAndRecovery:
 
         # Wait for the worker to come back online
         assert worker.worker_id is not None
+        # Bound to a local: mypy does not carry the narrowing from the assert above into the
+        # nested function, since worker.worker_id is an attribute that could change between
+        # the assert and the call.
+        worker_id = worker.worker_id
 
         @backoff.on_exception(
             backoff.constant,
@@ -541,7 +545,7 @@ class TestRustUnavailableAndRecovery:
                 deadline_client=deadline_client,
                 farm_id=deadline_resources.farm.id,
                 fleet_id=deadline_resources.fleet.id,
-                worker_id=worker.worker_id,
+                worker_id=worker_id,
             )
 
         wait_worker_started()
