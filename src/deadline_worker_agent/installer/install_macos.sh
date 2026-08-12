@@ -157,8 +157,23 @@ user_primary_group_name() {
     local u="$1" gid
     gid=$(dscl_read_value /Users/"$u" PrimaryGroupID)
     if [[ -n "${gid}" ]]; then
-        dscl . -search /Groups PrimaryGroupID "${gid}" 2>/dev/null | awk 'NR==1{print $1}'
+        # `dscl . -list` plus an exact field comparison, NOT `dscl . -search`. -search is
+        # documented as a substring match on the attribute value, so searching for gid 20 can
+        # also match 120/200/2000, and the previous `awk 'NR==1{print $1}'` then took whichever
+        # record dscl emitted first. A wrong answer here is not cosmetic: the result becomes the
+        # group owner of /etc/amazon/deadline (0750), worker.toml (0640) and the agent's logs,
+        # and it also gates the job-group-is-not-the-primary-group invariant. is_broad_group
+        # cannot catch a misresolution, because it checks the resolved NAME and a wrong name is
+        # not in broad_groups.
+        #
+        # $NF rather than $2 for the same reason find_unused_system_id uses it: `-list` prints
+        # "name<padding>id", so a group name containing a space shifts the fields.
+        dscl . -list /Groups PrimaryGroupID 2>/dev/null \
+            | awk -v want="${gid}" 'NF>1 && $NF == want {print $1; exit}' || true
     fi
+    # Always succeed: callers decide what an empty result means. Without this the function's
+    # status is whatever the last command happened to return.
+    return 0
 }
 
 # Returns the highest unused ID in [200,500) from a dscl attribute listing.
@@ -353,8 +368,18 @@ is_broad_group() {
 if user_exists "${wa_user}"; then
     wa_group=$(user_primary_group_name "${wa_user}")
     if [[ -z "${wa_group}" ]]; then
-        # Fall back to the user name if the primary group name could not be resolved.
-        wa_group="${wa_user}"
+        # Fail here rather than falling back to "${wa_user}". That name has no group record on
+        # this path -- the block that creates /Groups/${wa_user} only runs when the USER is
+        # being created -- so every later `chown ${wa_user}:${wa_group}` would fail with
+        # "invalid group", and under set -e the install would stop somewhere in the middle,
+        # possibly after the job group, the group membership and the sudoers rule were already
+        # in place. Reachable without any resolver bug: a PrimaryGroupID pointing at a GID whose
+        # group record no longer exists (a removed MDM group, say) resolves to nothing.
+        echo "ERROR: could not resolve the primary group of the existing user ${wa_user}."
+        echo "       Its PrimaryGroupID does not correspond to any group on this host."
+        echo "       Fix that account's PrimaryGroupID, or pass --user with a different"
+        echo "       account, or omit --user to let the installer create one."
+        exit 1
     fi
 else
     # Newly created user -> its dedicated primary group has the same name as the user.
