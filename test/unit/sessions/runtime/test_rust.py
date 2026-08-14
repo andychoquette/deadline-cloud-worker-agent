@@ -241,13 +241,15 @@ class TestRustSessionRuntimeDelegation:
         # The pydantic environment is serialized and rebuilt natively before
         # being handed to the session. The fixture's job_parameter_values
         # contains one STRING param in dict form, which must appear as a
-        # parameterDefinitions entry.
+        # parameterDefinitions entry. The fixture declares no extensions, so the
+        # extensions key is omitted and the decode kwarg is None.
         mock_decode.assert_called_once_with(
             {
                 "specificationVersion": "environment-2023-09",
                 "environment": environment.model_dump.return_value,
                 "parameterDefinitions": [{"name": "Param1", "type": "STRING"}],
-            }
+            },
+            supported_extensions=None,
         )
         environment.model_dump.assert_called_once_with(
             mode="json", by_alias=True, exclude_none=True
