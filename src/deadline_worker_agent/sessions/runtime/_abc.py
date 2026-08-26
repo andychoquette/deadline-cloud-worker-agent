@@ -27,6 +27,25 @@ class SessionRuntimeCrashError(Exception):
     instead of the session thread dying silently."""
 
 
+class ResolvedSymbolTableError(Exception):
+    """The service served a resolvedSymbolTable this worker cannot parse.
+
+    Raised rather than degrading to None because the resolved table is the only
+    channel for step-scope EXPR `let` values: proceeding without it runs the
+    action with those symbols simply undefined, and the operator sees a
+    downstream "undefined symbol" failure that names the symbol rather than the
+    malformed table. Raising fails the action at start with the real cause,
+    through the same path as any other start-time exception.
+
+    Deliberately not a SessionRuntimeCrashError: that class is reserved for
+    BaseException escapes (e.g. a Rust panic) and emits a runtime-crash
+    telemetry event, which would misattribute a bad service payload.
+
+    The message must stay free of payload contents -- it is reported to the
+    service as the action's fail message. Full detail goes to the agent log.
+    """
+
+
 def convert_runtime_crashes(method: _F) -> _F:
     """Converts BaseException escapes from a runtime adapter method into
     SessionRuntimeCrashError. Regular Exceptions and interpreter control-flow
@@ -59,7 +78,6 @@ class SessionRuntime(ABC):
         os_env_vars: Optional[dict[str, str]] = None,
         resolved_symbol_table_json: str | None = None,
         step_name: str | None = None,
-        extra_let_bindings: list[str] | None = None,
     ) -> EnvironmentIdentifier:
         """Enter an environment; returns its identifier."""
         ...
@@ -87,7 +105,13 @@ class SessionRuntime(ABC):
         step_name: str | None = None,
         resolved_symbol_table_json: str | None = None,
     ) -> None:
-        """Run a task within the session's active environment(s)."""
+        """Run a task within the session's active environment(s).
+
+        ``resolved_symbol_table_json`` is the authoritative source of
+        step-scope EXPR ``let`` values (``StepTemplate.let``, RFC 0005 §3.6):
+        the service resolves that scope and serves it in the table, which both
+        runtimes seed as the base of their per-action symbol table.
+        """
         ...
 
     @abstractmethod

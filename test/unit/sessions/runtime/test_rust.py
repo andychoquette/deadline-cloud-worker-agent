@@ -18,7 +18,10 @@ from openjd.model._v1.types import ModelProfile, SpecificationRevision
 
 from deadline_worker_agent.file_system_operations import FileSystemPermissionEnum
 from deadline_worker_agent.sessions.runtime import SessionRuntime, SessionRuntimeConfig
-from deadline_worker_agent.sessions.runtime._abc import SessionRuntimeCrashError
+from deadline_worker_agent.sessions.runtime._abc import (
+    ResolvedSymbolTableError,
+    SessionRuntimeCrashError,
+)
 from deadline_worker_agent.sessions.runtime import rust as rust_module
 from deadline_worker_agent.sessions.runtime.rust import RustSessionRuntime
 from deadline_worker_agent.sessions.runtime.rust import _to_rust_task_parameter_values
@@ -282,8 +285,8 @@ class TestRustSessionRuntimeDelegation:
     def test_enter_environment_omits_step_context_from_rust_session(
         self, adapter: RustSessionRuntime, mock_session_instance: MagicMock
     ) -> None:
-        """step_name and extra_let_bindings are not forwarded to the _v1
-        session — it receives equivalent context via resolved_symtab."""
+        """step_name is not forwarded to the _v1 session — it receives
+        equivalent context via resolved_symtab."""
         environment = MagicMock()
         identifier = "env-456"
         os_env = {"K": "V"}
@@ -297,7 +300,6 @@ class TestRustSessionRuntimeDelegation:
                 identifier=identifier,
                 os_env_vars=os_env,
                 step_name="MyStep",
-                extra_let_bindings=["X=1"],
             )
 
         mock_session_instance.enter_environment.assert_called_once_with(
@@ -1415,10 +1417,14 @@ class TestResolvedSymbolTableForwarding:
         call_kwargs = mock_session_instance.run_task.call_args.kwargs
         assert call_kwargs["resolved_symtab"] is fake_symtab
 
-    def test_enter_environment_graceful_degradation_on_malformed_json(
+    def test_enter_environment_raises_on_malformed_json(
         self, adapter: RustSessionRuntime, mock_session_instance: MagicMock
     ) -> None:
-        """Malformed JSON causes a warning log and proceeds with resolved_symtab=None."""
+        """An unparseable table fails the action, matching the Python adapter.
+
+        The two adapters are kept in lockstep deliberately: the same malformed
+        payload must fail the same way whichever runtime the worker selects.
+        """
         environment = MagicMock()
 
         with (
@@ -1431,16 +1437,16 @@ class TestResolvedSymbolTableForwarding:
             ),
             patch.object(rust_module, "logger") as mock_logger,
         ):
-            adapter.enter_environment(
-                environment=environment,
-                identifier="env-1",
-                resolved_symbol_table_json="not valid json",
-            )
+            with pytest.raises(ResolvedSymbolTableError):
+                adapter.enter_environment(
+                    environment=environment,
+                    identifier="env-1",
+                    resolved_symbol_table_json="not valid json",
+                )
 
-        mock_logger.warning.assert_called_once()
-        assert "resolvedSymbolTable" in mock_logger.warning.call_args[0][0]
-        call_kwargs = mock_session_instance.enter_environment.call_args.kwargs
-        assert call_kwargs["resolved_symtab"] is None
+        mock_session_instance.enter_environment.assert_not_called()
+        mock_logger.error.assert_called_once()
+        assert "resolvedSymbolTable" in mock_logger.error.call_args[0][0]
 
     def test_exit_environment_forwards_resolved_symtab_when_json_present(
         self, adapter: RustSessionRuntime, mock_session_instance: MagicMock
@@ -1475,10 +1481,15 @@ class TestResolvedSymbolTableForwarding:
         call_kwargs = mock_session_instance.exit_environment.call_args.kwargs
         assert call_kwargs["resolved_symtab"] is None
 
-    def test_exit_environment_graceful_degradation_on_malformed_json(
+    def test_exit_environment_degrades_on_malformed_json_so_teardown_runs(
         self, adapter: RustSessionRuntime, mock_session_instance: MagicMock
     ) -> None:
-        """Malformed JSON causes a warning log and proceeds with resolved_symtab=None."""
+        """Exit degrades rather than raising, matching the Python adapter.
+
+        Raising here would leave the environment on Session._active_envs and
+        Session._cleanup would retry with the same stored table and swallow the
+        same failure, so onExit would never run.
+        """
         with (
             patch.object(
                 rust_module.SerializedSymbolTable,
@@ -1492,7 +1503,7 @@ class TestResolvedSymbolTableForwarding:
                 resolved_symbol_table_json="{not json",
             )
 
-        mock_logger.warning.assert_called_once()
-        assert "resolvedSymbolTable" in mock_logger.warning.call_args[0][0]
-        call_kwargs = mock_session_instance.exit_environment.call_args.kwargs
-        assert call_kwargs["resolved_symtab"] is None
+        mock_session_instance.exit_environment.assert_called_once()
+        assert mock_session_instance.exit_environment.call_args.kwargs["resolved_symtab"] is None
+        mock_logger.error.assert_called_once()
+        assert "resolvedSymbolTable" in mock_logger.error.call_args[0][0]

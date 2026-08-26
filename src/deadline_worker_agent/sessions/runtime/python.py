@@ -7,13 +7,13 @@ from logging import getLogger
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional
 
-from openjd.expr import SerializedSymbolTable
 from openjd.model import RevisionExtensions, SpecificationRevision
 from openjd.sessions import Session as OpenJDSession
 
-from . import SessionRuntime, SessionRuntimeConfig
+from . import ResolvedSymbolTableError, SessionRuntime, SessionRuntimeConfig
 
 if TYPE_CHECKING:
+    from openjd.expr import SerializedSymbolTable
     from openjd.sessions import (
         ActionStatus,
         EnvironmentIdentifier,
@@ -37,6 +37,13 @@ def _extract_job_name(json_str: str | None) -> str | None:
     if json_str is None:
         return None
     try:
+        # Imported lazily, behind the None guard above: SerializedSymbolTable
+        # lives in openjd.expr, a facade over the native extension. A session
+        # that never receives a resolved table must not load the extension.
+        # Inside the try so an extension-load ImportError is handled here rather
+        # than escaping raw from a lazy import.
+        from openjd.expr import SerializedSymbolTable
+
         symtab = SerializedSymbolTable.from_json_str(json_str).to_symtab()
         entry = symtab.get("Job.Name")
         if entry is None:
@@ -46,6 +53,58 @@ def _extract_job_name(json_str: str | None) -> str | None:
     except Exception as e:
         logger.warning("Failed to extract Job.Name from resolvedSymbolTable: %s", e)
         return None
+
+
+def _parse_resolved_symtab(json_str: str | None) -> Optional["SerializedSymbolTable"]:
+    """Parse a resolved symbol table JSON string into a SerializedSymbolTable.
+
+    Returns None only when the input is None -- the common, benign case of the
+    service serving no table. A table that is present but unparseable raises
+    ResolvedSymbolTableError instead of degrading to None, because the table is
+    the only channel for step-scope `let` values: proceeding without it would
+    run the action with those symbols undefined and report a downstream
+    "undefined symbol" error naming the symbol rather than the real cause. It
+    would also make a partially-serviceable table (schema skew, truncation)
+    indistinguishable from "no table served".
+
+    Callers on the enter and run paths let that propagate. exit_environment
+    deliberately catches it and degrades to None so teardown is unconditional --
+    see the comment there.
+
+    Mirrors _parse_resolved_symtab in the Rust adapter. Note the deliberate
+    asymmetry with _extract_job_name above, which also degrades: it runs during
+    session construction rather than action start, and the job name it recovers
+    only labels log output.
+    """
+    if json_str is None:
+        return None
+    try:
+        # Imported lazily, behind the None guard above: see _extract_job_name.
+        # Deliberately inside the try. Moving this import from module scope to
+        # function scope moved where an unloadable native extension is
+        # discovered: it used to fail at adapter construction, which
+        # _factory.create_session_runtime turns into a clean NotImplementedError
+        # ("adapter is not available"). Left outside the try it would instead
+        # surface mid-session as a raw ImportError reported as the task's fail
+        # message. Catching it here gives it the same handling as any other
+        # reason the table cannot be turned into a symbol table.
+        from openjd.expr import SerializedSymbolTable
+
+        return SerializedSymbolTable.from_json_str(json_str)
+    # Broad on purpose. Empirically the decoder only raises ValueError, and only
+    # for malformed JSON: openjd-model 0.11.6 accepts a well-formed table with an
+    # unknown symbol type, an unknown extra field, or a missing required field,
+    # so an additive service-side change does not land here. The breadth is to
+    # cover the ImportError above and anything the native extension surprises us
+    # with, not to paper over version skew.
+    except Exception as e:
+        # Full detail to the agent log; the raised message reaches the service
+        # as the action's fail message, so it must not echo payload contents.
+        logger.error("Failed to parse resolvedSymbolTable: %s", e)
+        raise ResolvedSymbolTableError(
+            "The service served a resolvedSymbolTable this worker could not parse "
+            f"({type(e).__name__}); step-scope `let` values cannot be resolved"
+        ) from e
 
 
 class PythonSessionRuntime(SessionRuntime):
@@ -81,16 +140,16 @@ class PythonSessionRuntime(SessionRuntime):
         os_env_vars: Optional[dict[str, str]] = None,
         resolved_symbol_table_json: str | None = None,
         step_name: str | None = None,
-        extra_let_bindings: list[str] | None = None,
     ) -> EnvironmentIdentifier:
-        # resolved_symbol_table_json: not forwarded — the v0 Python session does
-        # not support pre-resolved symbol tables.
+        # Parse the pre-resolved symbol table if the service provided one. The
+        # v0 session seeds it as the base of its per-action symbol table, the
+        # same layering the _v1 (Rust) session applies.
         return self._session.enter_environment(
             environment=environment,
             identifier=identifier,
             os_env_vars=os_env_vars,
             step_name=step_name,
-            extra_let_bindings=extra_let_bindings,
+            resolved_symtab=_parse_resolved_symtab(resolved_symbol_table_json),
         )
 
     def exit_environment(
@@ -101,12 +160,35 @@ class PythonSessionRuntime(SessionRuntime):
         keep_session_running: bool = False,
         resolved_symbol_table_json: str | None = None,
     ) -> None:
-        # resolved_symbol_table_json: not forwarded — the v0 Python session does
-        # not support pre-resolved symbol tables.
+        # Parse the pre-resolved symbol table if the service provided one.
+        #
+        # Unlike enter_environment and run_task, an unparseable table must NOT
+        # fail this call. Session.exit_environment pops the environment off
+        # _active_envs only after this returns, so raising would leave it active
+        # and Session._cleanup would retry the exit with the same stored table
+        # inside a `except Exception: warning` -- same payload, same failure,
+        # swallowed. onExit would never run: no license released, no daemon
+        # stopped, no teardown of whatever the environment set up, and only a
+        # warning line to show for it.
+        #
+        # The trade differs from the enter/run paths. There, degrading means an
+        # action runs with step-scope symbols undefined and reports a confusing
+        # downstream error instead of the real cause. Here it means onExit runs
+        # with some symbols possibly undefined -- recoverable, and visible in the
+        # session log -- rather than not running at all and leaking state the
+        # worker cannot reclaim later. Teardown stays unconditional.
+        #
+        # _parse_resolved_symtab has already logged the cause at error level.
+        try:
+            resolved_symtab = _parse_resolved_symtab(resolved_symbol_table_json)
+        except ResolvedSymbolTableError:
+            resolved_symtab = None
+
         self._session.exit_environment(
             identifier=identifier,
             os_env_vars=os_env_vars,
             keep_session_running=keep_session_running,
+            resolved_symtab=resolved_symtab,
         )
 
     def run_task(
@@ -119,14 +201,17 @@ class PythonSessionRuntime(SessionRuntime):
         step_name: str | None = None,
         resolved_symbol_table_json: str | None = None,
     ) -> None:
-        # resolved_symbol_table_json: not forwarded — the v0 Python session does
-        # not support pre-resolved symbol tables.
+        # Parse the pre-resolved symbol table if the service provided one. The
+        # v0 session seeds it first and layers Session.*/Task.* values on top,
+        # matching the _v1 (Rust) session. It is the only channel for
+        # step-scope `let` values.
         self._session.run_task(
             step_script=step_script,
             task_parameter_values=task_parameter_values,
             os_env_vars=os_env_vars,
             log_task_banner=log_task_banner,
             step_name=step_name,
+            resolved_symtab=_parse_resolved_symtab(resolved_symbol_table_json),
         )
 
     def _run_task_without_session_env(

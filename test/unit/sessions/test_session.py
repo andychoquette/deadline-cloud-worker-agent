@@ -2592,6 +2592,46 @@ class TestRunAttachmentSyncTask:
         assert exc_info.value is expected_exception
 
 
+class TestRunTask:
+    """Session.run_task is a pass-through to the configured runtime.
+
+    The resolved symbol table is the only channel carrying step-scope EXPR
+    `let` values, so its forwarding is what pins those names reaching the
+    task's symbol table.
+    """
+
+    @pytest.mark.parametrize(
+        "resolved_symbol_table_json",
+        [
+            None,
+            '[{"name":"region","type":"string","value":"us-west-2"}]',
+            '[{"name":"a","type":"int","value":"1"},{"name":"b","type":"int","value":"2"}]',
+        ],
+        ids=["none", "single", "multiple_dependent"],
+    )
+    def test_forwards_resolved_symbol_table_json_to_runtime(
+        self,
+        session: Session,
+        mock_runtime: MagicMock,
+        resolved_symbol_table_json: str | None,
+    ) -> None:
+        # GIVEN
+        step_script_model = MagicMock()
+
+        # WHEN
+        session.run_task(
+            step_script=step_script_model,
+            task_parameter_values=dict[str, ParameterValue](),
+            resolved_symbol_table_json=resolved_symbol_table_json,
+        )
+
+        # THEN
+        assert (
+            mock_runtime.run_task.call_args.kwargs["resolved_symbol_table_json"]
+            is resolved_symbol_table_json
+        )
+
+
 class TestRuntimeCrashTelemetry:
     """A SessionRuntimeCrashError surfacing from an action start (WA-7: e.g. a
     Rust panic converted at the adapter boundary) must emit a runtime_failure

@@ -46,7 +46,7 @@ from deadline_worker_agent.file_system_operations import (
 
 from . import SessionRuntime, SessionRuntimeConfig
 from .._extensions import RUNTIME_CAPABILITY_EXTENSIONS
-from ._abc import convert_runtime_crashes
+from ._abc import ResolvedSymbolTableError, convert_runtime_crashes
 
 if TYPE_CHECKING:
     from openjd.sessions import (
@@ -272,16 +272,24 @@ def _to_rust_model_extensions(
 def _parse_resolved_symtab(json_str: str | None) -> Any:
     """Parse a resolved symbol table JSON string into a SerializedSymbolTable.
 
-    Returns None when the input is None or when parsing fails (graceful
-    degradation — the session proceeds without the pre-resolved table).
+    Returns None only when the input is None -- the common, benign case of the
+    service serving no table. A table that is present but unparseable raises
+    ResolvedSymbolTableError rather than degrading to None; see the Python
+    adapter's copy for the reasoning. Kept in lockstep with it deliberately: the
+    same malformed payload must fail the same way whichever runtime is selected.
     """
     if json_str is None:
         return None
     try:
         return SerializedSymbolTable.from_json_str(json_str)
     except Exception as e:
-        logger.warning("Failed to parse resolvedSymbolTable; proceeding without it: %s", e)
-        return None
+        # Full detail to the agent log; the raised message reaches the service
+        # as the action's fail message, so it must not echo payload contents.
+        logger.error("Failed to parse resolvedSymbolTable: %s", e)
+        raise ResolvedSymbolTableError(
+            "The service served a resolvedSymbolTable this worker could not parse "
+            f"({type(e).__name__}); step-scope `let` values cannot be resolved"
+        ) from e
 
 
 class RustSessionRuntime(SessionRuntime):
@@ -362,7 +370,6 @@ class RustSessionRuntime(SessionRuntime):
         os_env_vars: Optional[dict[str, str]] = None,
         resolved_symbol_table_json: str | None = None,
         step_name: str | None = None,
-        extra_let_bindings: list[str] | None = None,
     ) -> EnvironmentIdentifier:
         # The shared action layer hands a pydantic v2023_09 environment, but the
         # Rust session needs a native _v1 environment. Serialize to the OpenJD
@@ -394,8 +401,8 @@ class RustSessionRuntime(SessionRuntime):
         # Parse the pre-resolved symbol table if the service provided one.
         resolved_symtab = _parse_resolved_symtab(resolved_symbol_table_json)
 
-        # step_name and extra_let_bindings are Python-session inputs; the Rust
-        # session receives equivalent step context via resolved_symtab.
+        # step_name is a Python-session input; the Rust session receives
+        # equivalent step context via resolved_symtab.
         return self._session.enter_environment(
             environment=native_environment,
             identifier=identifier,
@@ -412,7 +419,16 @@ class RustSessionRuntime(SessionRuntime):
         keep_session_running: bool = False,
         resolved_symbol_table_json: str | None = None,
     ) -> None:
-        resolved_symtab = _parse_resolved_symtab(resolved_symbol_table_json)
+        # An unparseable table must not fail the exit: raising would leave the
+        # environment on Session._active_envs and Session._cleanup would retry
+        # with the same stored table and swallow the same failure, so onExit
+        # would never run. See the Python adapter's copy for the full reasoning;
+        # the two are kept in lockstep on purpose.
+        try:
+            resolved_symtab = _parse_resolved_symtab(resolved_symbol_table_json)
+        except ResolvedSymbolTableError:
+            resolved_symtab = None
+
         self._session.exit_environment(
             identifier=identifier,
             os_env_vars=os_env_vars,

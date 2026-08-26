@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import builtins
 from datetime import timedelta
 from pathlib import Path
 from typing import Generator
@@ -11,7 +12,10 @@ import pytest
 
 from openjd.model import SpecificationRevision
 
-from deadline_worker_agent.sessions.runtime import SessionRuntimeConfig
+from deadline_worker_agent.sessions.runtime import (
+    ResolvedSymbolTableError,
+    SessionRuntimeConfig,
+)
 from deadline_worker_agent.sessions.runtime import python as python_module
 from deadline_worker_agent.sessions.runtime.python import PythonSessionRuntime
 
@@ -109,7 +113,7 @@ class TestPythonSessionRuntimeDelegation:
             identifier=identifier,
             os_env_vars=os_env,
             step_name=None,
-            extra_let_bindings=None,
+            resolved_symtab=None,
         )
         # enter_environment is the only non-void method — verify the return value
         # (EnvironmentIdentifier) flows through the adapter.
@@ -118,8 +122,8 @@ class TestPythonSessionRuntimeDelegation:
     def test_enter_environment_forwards_step_context_to_wrapped_session(
         self, adapter: PythonSessionRuntime, mock_session_instance: MagicMock
     ) -> None:
-        """Non-None step_name and extra_let_bindings are forwarded to the
-        Python session, which uses them for wrap-action symbol resolution."""
+        """A non-None step_name is forwarded to the Python session, which uses
+        it for wrap-action symbol resolution."""
         env = MagicMock()
         identifier = "env-123"
         os_env = {"K": "V"}
@@ -129,7 +133,6 @@ class TestPythonSessionRuntimeDelegation:
             identifier=identifier,
             os_env_vars=os_env,
             step_name="MyStep",
-            extra_let_bindings=["VAR=value"],
         )
 
         mock_session_instance.enter_environment.assert_called_once_with(
@@ -137,7 +140,7 @@ class TestPythonSessionRuntimeDelegation:
             identifier=identifier,
             os_env_vars=os_env,
             step_name="MyStep",
-            extra_let_bindings=["VAR=value"],
+            resolved_symtab=None,
         )
         assert result is mock_session_instance.enter_environment.return_value
 
@@ -151,22 +154,10 @@ class TestPythonSessionRuntimeDelegation:
         )
 
         mock_session_instance.exit_environment.assert_called_once_with(
-            identifier=identifier, os_env_vars={"A": "B"}, keep_session_running=True
-        )
-
-    def test_exit_environment_does_not_forward_resolved_symbol_table_json(
-        self, adapter: PythonSessionRuntime, mock_session_instance: MagicMock
-    ) -> None:
-        """The v0 Python session has no resolved-table API; the kwarg is accepted but not forwarded."""
-        identifier = MagicMock()
-
-        adapter.exit_environment(
             identifier=identifier,
-            resolved_symbol_table_json='[{"name":"Job.Name","type":"string","value":"X"}]',
-        )
-
-        mock_session_instance.exit_environment.assert_called_once_with(
-            identifier=identifier, os_env_vars=None, keep_session_running=False
+            os_env_vars={"A": "B"},
+            keep_session_running=True,
+            resolved_symtab=None,
         )
 
     def test_run_task_when_called_delegates_to_wrapped_session(
@@ -188,6 +179,7 @@ class TestPythonSessionRuntimeDelegation:
             os_env_vars={"X": "Y"},
             log_task_banner=False,
             step_name=None,
+            resolved_symtab=None,
         )
 
     def test_run_task_without_session_env_when_called_delegates_to_private_method(
@@ -347,3 +339,245 @@ class TestPythonSessionRuntimeJobName:
         mock_logger.warning.assert_called_once()
         call_kwargs = mock_openjd_session.call_args.kwargs
         assert call_kwargs["job_name"] is None
+
+
+class TestResolvedSymbolTableForwarding:
+    """Tests for resolved_symbol_table_json parsing and forwarding to the v0 session.
+
+    Mirrors TestResolvedSymbolTableForwarding in test_rust.py. python.py imports
+    SerializedSymbolTable lazily (extension purity), so the class is patched at
+    its source (openjd.expr) rather than as a module attribute of python.py.
+    """
+
+    @pytest.fixture()
+    def adapter(
+        self, runtime_config: SessionRuntimeConfig, mock_openjd_session: MagicMock
+    ) -> PythonSessionRuntime:
+        return PythonSessionRuntime(runtime_config)
+
+    @pytest.fixture()
+    def mock_session_instance(self, mock_openjd_session: MagicMock) -> MagicMock:
+        return mock_openjd_session.return_value
+
+    def test_enter_environment_forwards_resolved_symtab_when_json_present(
+        self, adapter: PythonSessionRuntime, mock_session_instance: MagicMock
+    ) -> None:
+        """When resolved_symbol_table_json is provided, it's parsed and forwarded."""
+        from openjd.expr import SerializedSymbolTable
+
+        environment = MagicMock()
+        symtab_json = '[{"name":"Job.Name","type":"string","value":"TestJob"}]'
+        fake_symtab = MagicMock()
+
+        with patch.object(
+            SerializedSymbolTable, "from_json_str", return_value=fake_symtab
+        ) as mock_from_json:
+            adapter.enter_environment(
+                environment=environment,
+                identifier="env-1",
+                resolved_symbol_table_json=symtab_json,
+            )
+
+        mock_from_json.assert_called_once_with(symtab_json)
+        call_kwargs = mock_session_instance.enter_environment.call_args.kwargs
+        assert call_kwargs["resolved_symtab"] is fake_symtab
+
+    def test_run_task_forwards_resolved_symtab_when_json_present(
+        self, adapter: PythonSessionRuntime, mock_session_instance: MagicMock
+    ) -> None:
+        """When resolved_symbol_table_json is provided, it's parsed and forwarded."""
+        from openjd.expr import SerializedSymbolTable
+
+        step_script = MagicMock()
+        symtab_json = '[{"name":"Job.Name","type":"string","value":"TestJob"}]'
+        fake_symtab = MagicMock()
+
+        with patch.object(
+            SerializedSymbolTable, "from_json_str", return_value=fake_symtab
+        ) as mock_from_json:
+            adapter.run_task(
+                step_script=step_script,
+                task_parameter_values={},
+                resolved_symbol_table_json=symtab_json,
+            )
+
+        mock_from_json.assert_called_once_with(symtab_json)
+        call_kwargs = mock_session_instance.run_task.call_args.kwargs
+        assert call_kwargs["resolved_symtab"] is fake_symtab
+
+    def test_exit_environment_forwards_resolved_symtab_when_json_present(
+        self, adapter: PythonSessionRuntime, mock_session_instance: MagicMock
+    ) -> None:
+        """When resolved_symbol_table_json is provided, it's parsed and forwarded."""
+        from openjd.expr import SerializedSymbolTable
+
+        symtab_json = '[{"name":"Job.Name","type":"string","value":"TestJob"}]'
+        fake_symtab = MagicMock()
+
+        with patch.object(
+            SerializedSymbolTable, "from_json_str", return_value=fake_symtab
+        ) as mock_from_json:
+            adapter.exit_environment(
+                identifier="env-1",
+                resolved_symbol_table_json=symtab_json,
+            )
+
+        mock_from_json.assert_called_once_with(symtab_json)
+        call_kwargs = mock_session_instance.exit_environment.call_args.kwargs
+        assert call_kwargs["resolved_symtab"] is fake_symtab
+
+    def test_exit_environment_passes_none_when_json_is_none(
+        self, adapter: PythonSessionRuntime, mock_session_instance: MagicMock
+    ) -> None:
+        """When resolved_symbol_table_json is None, the parser is not invoked."""
+        from openjd.expr import SerializedSymbolTable
+
+        with patch.object(SerializedSymbolTable, "from_json_str") as mock_from_json:
+            adapter.exit_environment(
+                identifier="env-1",
+                resolved_symbol_table_json=None,
+            )
+
+        mock_from_json.assert_not_called()
+        call_kwargs = mock_session_instance.exit_environment.call_args.kwargs
+        assert call_kwargs["resolved_symtab"] is None
+
+    def test_enter_environment_raises_on_malformed_json(
+        self, adapter: PythonSessionRuntime, mock_session_instance: MagicMock
+    ) -> None:
+        """An unparseable table fails the action instead of silently dropping it.
+
+        The table is the only channel for step-scope `let`, so degrading to None
+        would enter the environment with those symbols undefined and surface a
+        downstream "undefined symbol" error naming the symbol, not the cause.
+        """
+        environment = MagicMock()
+
+        with patch.object(python_module, "logger") as mock_logger:
+            with pytest.raises(ResolvedSymbolTableError):
+                adapter.enter_environment(
+                    environment=environment,
+                    identifier="env-1",
+                    resolved_symbol_table_json="not valid json",
+                )
+
+        # The environment must not be entered at all -- a half-entered
+        # environment would land on Session._active_envs and be exited later.
+        mock_session_instance.enter_environment.assert_not_called()
+        mock_logger.error.assert_called_once()
+        assert "resolvedSymbolTable" in mock_logger.error.call_args[0][0]
+
+    def test_run_task_raises_on_malformed_json(
+        self, adapter: PythonSessionRuntime, mock_session_instance: MagicMock
+    ) -> None:
+        """An unparseable table fails the task instead of running it degraded."""
+        with patch.object(python_module, "logger") as mock_logger:
+            with pytest.raises(ResolvedSymbolTableError):
+                adapter.run_task(
+                    step_script=MagicMock(),
+                    task_parameter_values={},
+                    resolved_symbol_table_json="{not json",
+                )
+
+        mock_session_instance.run_task.assert_not_called()
+        mock_logger.error.assert_called_once()
+        assert "resolvedSymbolTable" in mock_logger.error.call_args[0][0]
+
+    def test_exit_environment_degrades_on_malformed_json_so_teardown_runs(
+        self, adapter: PythonSessionRuntime, mock_session_instance: MagicMock
+    ) -> None:
+        """Exit must not be blocked by an unparseable table -- onExit still runs.
+
+        Deliberately the opposite of the enter and run paths. Session.exit_environment
+        pops _active_envs only after this returns, so raising would leave the
+        environment active and Session._cleanup would retry with the same stored
+        table and swallow the same failure -- onExit would never run, leaking
+        whatever the environment set up (licenses, daemons).
+        """
+        with patch.object(python_module, "logger") as mock_logger:
+            adapter.exit_environment(
+                identifier="env-1",
+                resolved_symbol_table_json="{not json",
+            )
+
+        # Teardown proceeded, with the table dropped rather than the exit skipped.
+        mock_session_instance.exit_environment.assert_called_once()
+        assert mock_session_instance.exit_environment.call_args.kwargs["resolved_symtab"] is None
+        # Still loud in the agent log, just not fatal.
+        mock_logger.error.assert_called_once()
+        assert "resolvedSymbolTable" in mock_logger.error.call_args[0][0]
+
+    def test_enter_and_run_still_raise_while_exit_degrades(
+        self, adapter: PythonSessionRuntime, mock_session_instance: MagicMock
+    ) -> None:
+        """Negative control for the exit carve-out: it must not soften enter/run.
+
+        A single flag or a misplaced try/except that degraded everywhere would
+        pass the exit test above; this pins that the carve-out is exit-only.
+        """
+        bad = "{not json"
+
+        with pytest.raises(ResolvedSymbolTableError):
+            adapter.enter_environment(environment=MagicMock(), resolved_symbol_table_json=bad)
+        with pytest.raises(ResolvedSymbolTableError):
+            adapter.run_task(
+                step_script=MagicMock(), task_parameter_values={}, resolved_symbol_table_json=bad
+            )
+
+        adapter.exit_environment(identifier="env-1", resolved_symbol_table_json=bad)
+
+        mock_session_instance.enter_environment.assert_not_called()
+        mock_session_instance.run_task.assert_not_called()
+        mock_session_instance.exit_environment.assert_called_once()
+
+    def test_extension_load_failure_becomes_resolved_symbol_table_error(
+        self, adapter: PythonSessionRuntime, mock_session_instance: MagicMock
+    ) -> None:
+        """An unloadable native extension must not escape as a raw ImportError.
+
+        The openjd.expr import is lazy (function-local, to keep the extension off
+        the import path for sessions that never receive a table). That moved where
+        an unloadable extension is discovered: it no longer fails at adapter
+        construction, where _factory.create_session_runtime converts ImportError
+        into NotImplementedError. Left uncaught it would surface mid-session as a
+        raw ImportError reported as the task's fail message.
+        """
+        real_import = builtins.__import__
+
+        def fail_openjd_expr(name: str, *args: object, **kwargs: object) -> object:
+            if name == "openjd.expr":
+                raise ImportError("native extension unavailable on this platform")
+            return real_import(name, *args, **kwargs)  # type: ignore[arg-type]
+
+        with patch.object(builtins, "__import__", side_effect=fail_openjd_expr):
+            with pytest.raises(ResolvedSymbolTableError):
+                adapter.run_task(
+                    step_script=MagicMock(),
+                    task_parameter_values={},
+                    resolved_symbol_table_json='[{"name":"X","type":"string","value":"1"}]',
+                )
+
+        mock_session_instance.run_task.assert_not_called()
+
+    def test_malformed_table_error_does_not_leak_payload_and_chains_cause(
+        self, adapter: PythonSessionRuntime
+    ) -> None:
+        """The fail message reaches the service, so it must not echo the payload.
+
+        Session._start_action reports str(e) as the action's fail message, which
+        the scheduler forwards as progressMessage. The underlying parse error is
+        preserved as __cause__ for the agent-side traceback instead.
+        """
+        payload = '{"UNIQUE_PAYLOAD_MARKER_9f3a": "should not be echoed"'
+
+        with pytest.raises(ResolvedSymbolTableError) as excinfo:
+            adapter.run_task(
+                step_script=MagicMock(),
+                task_parameter_values={},
+                resolved_symbol_table_json=payload,
+            )
+
+        message = str(excinfo.value)
+        assert "UNIQUE_PAYLOAD_MARKER_9f3a" not in message
+        assert "resolvedSymbolTable" in message
+        assert excinfo.value.__cause__ is not None
