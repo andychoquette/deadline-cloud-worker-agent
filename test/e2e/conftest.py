@@ -8,9 +8,9 @@ import threading
 import traceback
 from collections.abc import Generator
 from configparser import ConfigParser
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import InitVar, dataclass, field
-from typing import Callable, Optional, Type
+from typing import Callable, Optional, Type, TypeVar
 
 import backoff
 import boto3
@@ -32,11 +32,16 @@ from deadline_test_fixtures import (
     Ec2Tag,
     Farm,
     Fleet,
+    JobRunAsUser,
     LocalMacWorker,
     OperatingSystem,
     PosixSessionUser,
     Queue,
+    QueueFleetAssociation,
 )
+
+# Not re-exported from the package root, unlike the other model types.
+from deadline_test_fixtures.models import WindowsSessionUser
 
 LOG = logging.getLogger(__name__)
 
@@ -158,12 +163,191 @@ def _shutdown_s3_transfer_manager(
     LOG.info(f"Shut down S3 Transfer Manager: {desc} (num threads joined: {num_threads_joined})")
 
 
+def _scaffold_deadline_resources(
+    request: pytest.FixtureRequest,
+    operating_system: OperatingSystem,
+) -> Generator[DeadlineResources, None, None]:
+    """Create the Deadline resources for this run, then delete them.
+
+    Used when BYO_DEADLINE is not "true". CI passes pre-provisioned IDs instead,
+    which is cheaper per run; this path exists so a run can stand itself up on a
+    platform CI has no resources for yet, and so a developer needs only
+    credentials rather than twelve resource IDs.
+
+    Resource roles come from `bootstrap_resources`, which either deploys the
+    bootstrap CloudFormation stack or reads its own env vars when
+    BYO_BOOTSTRAP=true. CreateFleet requires a roleArn, so there is no
+    role-free variant of this path.
+    """
+    bootstrap: BootstrapResources = request.getfixturevalue("bootstrap_resources")
+    deadline_client = boto3.client("deadline")
+
+    os_family = (
+        "MACOS"
+        if operating_system.is_macos()
+        else ("WINDOWS" if operating_system.name == "WIN2022" else "LINUX")
+    )
+    cpu_architecture = "arm64" if operating_system.is_macos() else "x86_64"
+
+    def _storage_profile(display_name: str, family: str) -> str:
+        response = deadline_client.create_storage_profile(
+            farmId=farm.id, displayName=display_name, osFamily=family
+        )
+        storage_profile_id = response["storageProfileId"]
+        # Storage profiles are not modelled by deadline-cloud-test-fixtures, so
+        # register the delete directly. Registered on the same stack as everything
+        # else, which unwinds in reverse, so these go before the farm they belong to.
+        stack.callback(
+            lambda: deadline_client.delete_storage_profile(
+                farmId=farm.id, storageProfileId=storage_profile_id
+            )
+        )
+        return storage_profile_id
+
+    def _fleet_configuration(mode: str) -> dict:
+        return {
+            "customerManaged": {
+                "mode": mode,
+                "workerCapabilities": {
+                    "vCpuCount": {"min": 1},
+                    "memoryMiB": {"min": 1024},
+                    # The API models osFamily as WINDOWS | LINUX | MACOS. botocore does
+                    # not validate enums client-side, so a wrong casing fails at the
+                    # service rather than locally.
+                    "osFamily": os_family,
+                    "cpuArchitectureType": cpu_architecture,
+                },
+            }
+        }
+
+    T = TypeVar("T", Farm, Fleet, Queue, QueueFleetAssociation)
+
+    @contextmanager
+    def deletable(resource: T) -> Generator[T, None, None]:
+        try:
+            yield resource
+        finally:
+            resource.delete(client=deadline_client)
+
+    with ExitStack() as stack:
+        farm = stack.enter_context(
+            deletable(Farm.create(client=deadline_client, display_name="worker-agent-e2e-farm"))
+        )
+
+        def _queue(display_name: str, **kwargs) -> Queue:
+            return stack.enter_context(
+                deletable(
+                    Queue.create(
+                        client=deadline_client,
+                        display_name=display_name,
+                        farm=farm,
+                        job_attachments=bootstrap.job_attachments,
+                        **kwargs,
+                    )
+                )
+            )
+
+        queue_a = _queue("e2e-queue-a", role_arn=bootstrap.session_role_arn)
+        queue_b = _queue("e2e-queue-b", role_arn=bootstrap.session_role_arn)
+        scaling_queue = _queue("e2e-scaling-queue", role_arn=bootstrap.session_role_arn)
+        jobs_run_as_agent_user_queue = _queue(
+            "e2e-jobs-run-as-agent-user-queue",
+            role_arn=bootstrap.session_role_arn,
+            job_run_as_user=JobRunAsUser(
+                posix=PosixSessionUser("", ""),
+                runAs="WORKER_AGENT_USER",
+                windows=WindowsSessionUser("", ""),
+            ),
+        )
+        # Deliberately given the worker role rather than the session role: its trust
+        # policy does not admit queue-user credential vending, which is the failure
+        # the tests using this queue assert on.
+        non_valid_role_queue = _queue(
+            "e2e-non-valid-role-queue", role_arn=bootstrap.worker_role_arn
+        )
+
+        fleet = stack.enter_context(
+            deletable(
+                Fleet.create(
+                    client=deadline_client,
+                    display_name="e2e-fleet",
+                    farm=farm,
+                    configuration=_fleet_configuration("NO_SCALING"),
+                    max_worker_count=1,
+                    role_arn=bootstrap.worker_role_arn,
+                )
+            )
+        )
+        scaling_fleet = stack.enter_context(
+            deletable(
+                Fleet.create(
+                    client=deadline_client,
+                    display_name="e2e-scaling-fleet",
+                    farm=farm,
+                    configuration=_fleet_configuration("EVENT_BASED_AUTO_SCALING"),
+                    max_worker_count=1,
+                    role_arn=bootstrap.worker_role_arn,
+                )
+            )
+        )
+
+        for queue, target_fleet in (
+            (queue_a, fleet),
+            (queue_b, fleet),
+            (jobs_run_as_agent_user_queue, fleet),
+            (non_valid_role_queue, fleet),
+            (scaling_queue, scaling_fleet),
+        ):
+            stack.enter_context(
+                deletable(
+                    QueueFleetAssociation.create(
+                        client=deadline_client, farm=farm, queue=queue, fleet=target_fleet
+                    )
+                )
+            )
+
+        # Four storage profile IDs are required. The windows-named pair keeps that
+        # family regardless of the run's platform, since the tests that read them
+        # exercise cross-platform path mapping.
+        run_storage_profile = _storage_profile(
+            f"e2e-{os_family.lower()}-storage-profile", os_family
+        )
+        windows_storage_profile = _storage_profile("e2e-windows-storage-profile", "WINDOWS")
+
+        LOG.info(
+            f"Created Deadline resources - Farm ID: {farm.id}, Fleet ID: {fleet.id}, "
+            f"Queue A ID: {queue_a.id}, osFamily: {os_family}, arch: {cpu_architecture}"
+        )
+
+        yield DeadlineResources(
+            farm_id=farm.id,
+            queue_a_id=queue_a.id,
+            queue_b_id=queue_b.id,
+            jobs_run_as_agent_user_queue_id=jobs_run_as_agent_user_queue.id,
+            non_valid_role_queue_id=non_valid_role_queue.id,
+            fleet_id=fleet.id,
+            scaling_queue_id=scaling_queue.id,
+            scaling_fleet_id=scaling_fleet.id,
+            job_storage_profile_id=run_storage_profile,
+            windows_job_storage_profile_id=windows_storage_profile,
+            fleet_storage_profile_id=run_storage_profile,
+            windows_fleet_storage_profile_id=windows_storage_profile,
+        )
+
+
 @pytest.fixture(scope="session")
-def deadline_resources() -> Generator[DeadlineResources, None, None]:
+def deadline_resources(
+    request: pytest.FixtureRequest,
+    operating_system: OperatingSystem,
+) -> Generator[DeadlineResources, None, None]:
     """
     Gets Deadline resources required for running tests.
 
     Environment Variables:
+        BYO_DEADLINE: Whether to use pre-provisioned resources. Defaults to "true",
+            which is what CI does. Set it to "false" to have the run create and then
+            delete its own farm, queues, fleets, and storage profiles, in which case
+            none of the ID variables below are read.
         FARM_ID: ID of the Deadline farm to use.
         QUEUE_A_ID: ID of a non scaling Deadline queue to use for tests.
         QUEUE_B_ID: ID of a non scaling Deadline queue to use for tests.
@@ -181,6 +365,10 @@ def deadline_resources() -> Generator[DeadlineResources, None, None]:
     Returns:
         DeadlineResources: The Deadline resources used for tests
     """
+    if os.environ.get("BYO_DEADLINE", "true").lower() != "true":
+        yield from _scaffold_deadline_resources(request, operating_system)
+        return
+
     farm_id = os.environ["FARM_ID"]
     queue_a_id = os.environ["QUEUE_A_ID"]
     queue_b_id = os.environ["QUEUE_B_ID"]
