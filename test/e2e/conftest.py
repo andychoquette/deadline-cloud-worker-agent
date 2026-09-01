@@ -32,6 +32,7 @@ from deadline_test_fixtures import (
     Ec2Tag,
     Farm,
     Fleet,
+    LocalMacWorker,
     OperatingSystem,
     PosixSessionUser,
     Queue,
@@ -324,9 +325,8 @@ def worker_config(
 def session_worker(
     request: pytest.FixtureRequest,
     worker_config: DeadlineWorkerConfiguration,
-    ec2_worker_type: Type[EC2InstanceWorker],
 ) -> Generator[DeadlineWorker, None, None]:
-    with create_worker(worker_config, ec2_worker_type, request) as worker:
+    with create_worker(worker_config, request) as worker:
         yield worker
 
     stop_worker(request, worker)
@@ -359,9 +359,8 @@ def asset_sync_worker_config(
 def asset_sync_class_worker(
     request: pytest.FixtureRequest,
     asset_sync_worker_config: DeadlineWorkerConfiguration,
-    ec2_worker_type: Type[EC2InstanceWorker],
 ) -> Generator[DeadlineWorker, None, None]:
-    with create_worker(asset_sync_worker_config, ec2_worker_type, request) as worker:
+    with create_worker(asset_sync_worker_config, request) as worker:
         yield worker
 
     stop_worker(request, worker)
@@ -371,9 +370,8 @@ def asset_sync_class_worker(
 def class_worker(
     request: pytest.FixtureRequest,
     worker_config: DeadlineWorkerConfiguration,
-    ec2_worker_type: Type[EC2InstanceWorker],
 ) -> Generator[DeadlineWorker, None, None]:
-    with create_worker(worker_config, ec2_worker_type, request) as worker:
+    with create_worker(worker_config, request) as worker:
         yield worker
 
     stop_worker(request, worker)
@@ -383,9 +381,8 @@ def class_worker(
 def function_worker(
     request: pytest.FixtureRequest,
     worker_config: DeadlineWorkerConfiguration,
-    ec2_worker_type: Type[EC2InstanceWorker],
 ) -> Generator[DeadlineWorker, None, None]:
-    with create_worker(worker_config, ec2_worker_type, request) as worker:
+    with create_worker(worker_config, request) as worker:
         yield worker
 
     stop_worker(request, worker)
@@ -394,14 +391,13 @@ def function_worker(
 @pytest.fixture(scope="function")
 def function_worker_factory(
     request: pytest.FixtureRequest,
-    ec2_worker_type: Type[EC2InstanceWorker],
-) -> Generator[Callable[[DeadlineWorkerConfiguration], EC2InstanceWorker], None, None]:
+) -> Generator[Callable[[DeadlineWorkerConfiguration], DeadlineWorker], None, None]:
     created_workers = []
 
     def _create_function_worker(
         custom_worker_config: DeadlineWorkerConfiguration,
     ):
-        with create_worker(custom_worker_config, ec2_worker_type, request) as worker:
+        with create_worker(custom_worker_config, request) as worker:
             created_workers.append(worker)
             return worker
 
@@ -441,7 +437,6 @@ def _grab_bootstrap_log(worker: DeadlineWorker) -> None:
 
 def create_worker(
     worker_config: DeadlineWorkerConfiguration,
-    ec2_worker_type: Type[EC2InstanceWorker],
     request: pytest.FixtureRequest,
 ):
     def __init__(self):
@@ -471,14 +466,30 @@ def create_worker(
         DeadlineWorker: Instance of the DeadlineWorker class that can be used to interact with the Worker.
     """
 
+    operating_system: OperatingSystem = request.getfixturevalue("operating_system")
+
     worker: DeadlineWorker
     if os.environ.get("USE_DOCKER_WORKER", "").lower() == "true":
         LOG.info("Creating Docker worker")
         worker = DockerContainerWorker(
             configuration=worker_config,
         )
+    elif operating_system.is_macos():
+        # macOS workers run on the host executing the tests rather than a provisioned
+        # instance: Mac hardware is only available on EC2 dedicated hosts, which bill a
+        # 24-hour minimum per allocation. The CI runner is itself ephemeral, so each job
+        # gets a clean host.
+        LOG.info("Creating local macOS worker")
+        worker = LocalMacWorker(
+            configuration=worker_config,
+            deadline_client=boto3.client("deadline"),
+        )
     else:
         LOG.info("Creating EC2 worker")
+        # Resolved here rather than as a fixture parameter: it raises for any non-EC2
+        # operating system, so requesting it eagerly would fail the macOS path before it
+        # is reached.
+        ec2_worker_type: Type[EC2InstanceWorker] = request.getfixturevalue("ec2_worker_type")
         ami_id = os.getenv("AMI_ID")
         subnet_id = os.getenv("SUBNET_ID")
         security_group_id = os.getenv("SECURITY_GROUP_ID")
@@ -615,13 +626,7 @@ def operating_system() -> OperatingSystem:
     elif os_env_var == "windows":
         return OperatingSystem(name="WIN2022")
     elif os_env_var == "macos":
-        # deadline-cloud-test-fixtures types this as Literal["AL2023", "WIN2022"], so mypy
-        # rejects "MACOS" until that package gains macOS support (it also needs a
-        # MacInstanceWorker: the posix worker hardcodes an AL2023 AMI and provisions with
-        # useradd/groupadd). Nothing sets OPERATING_SYSTEM=macos in CI yet, so this branch is
-        # unreachable today and kept only so the plumbing is in place; the ignore comes off
-        # with that release.
-        return OperatingSystem(name="MACOS")  # type: ignore[arg-type]
+        return OperatingSystem(name="MACOS")
     else:
         assert False, (
             f'Expected OPERATING_SYSTEM env var to be "linux", "windows", or "macos", '

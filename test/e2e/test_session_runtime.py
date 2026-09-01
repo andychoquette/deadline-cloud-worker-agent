@@ -48,7 +48,7 @@ Worker openjd package location (for making the Rust adapter unloadable):
     fault-injection step in TestRustUnavailableAndRecovery)
 """
 
-from typing import Generator, Type
+from typing import Generator
 
 import backoff
 import dataclasses
@@ -171,7 +171,6 @@ def _assert_log_contains(
 def explicit_runtime_worker(
     request: pytest.FixtureRequest,
     worker_config: DeadlineWorkerConfiguration,
-    ec2_worker_type: Type[EC2InstanceWorker],
 ) -> Generator[tuple[EC2InstanceWorker, str], None, None]:
     """Create a worker with session_runtime set to the parametrized value.
 
@@ -184,7 +183,6 @@ def explicit_runtime_worker(
     runtime: str = request.param
     with create_worker(
         dataclasses.replace(worker_config, session_runtime=runtime),
-        ec2_worker_type,
         request,
     ) as worker:
         assert isinstance(worker, EC2InstanceWorker)
@@ -231,11 +229,9 @@ class TestExplicitModeRouting:
 def service_selected_worker(
     request: pytest.FixtureRequest,
     worker_config: DeadlineWorkerConfiguration,
-    ec2_worker_type: Type[EC2InstanceWorker],
 ) -> Generator[DeadlineWorker, None, None]:
     with create_worker(
         dataclasses.replace(worker_config, session_runtime="service-selected"),
-        ec2_worker_type,
         request,
     ) as worker:
         assert isinstance(worker, EC2InstanceWorker)
@@ -364,11 +360,9 @@ class TestServiceSelectedWithPythonexprHint:
 def rust_unavailable_worker(
     request: pytest.FixtureRequest,
     worker_config: DeadlineWorkerConfiguration,
-    ec2_worker_type: Type[EC2InstanceWorker],
 ) -> Generator[DeadlineWorker, None, None]:
     with create_worker(
         dataclasses.replace(worker_config, session_runtime="rust"),
-        ec2_worker_type,
         request,
     ) as worker:
         assert isinstance(worker, EC2InstanceWorker)
