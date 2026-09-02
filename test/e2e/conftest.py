@@ -315,6 +315,12 @@ def _scaffold_deadline_resources(
             raw_kwargs=queue_configured_user,
         )
 
+        # Matches the count the pre-provisioned CI fleets use. One worker per fleet is not
+        # enough even though a run only ever has one host: the suite creates a worker per
+        # test in places, and a worker record keeps counting against this until it is
+        # deleted, so a low cap makes CreateWorker fail for the rest of the run.
+        max_worker_count = 15
+
         fleet = stack.enter_context(
             deletable(
                 Fleet.create(
@@ -322,7 +328,7 @@ def _scaffold_deadline_resources(
                     display_name="e2e-fleet",
                     farm=farm,
                     configuration=_fleet_configuration("NO_SCALING"),
-                    max_worker_count=1,
+                    max_worker_count=max_worker_count,
                     role_arn=bootstrap.worker_role_arn,
                 )
             )
@@ -334,7 +340,7 @@ def _scaffold_deadline_resources(
                     display_name="e2e-scaling-fleet",
                     farm=farm,
                     configuration=_fleet_configuration("EVENT_BASED_AUTO_SCALING"),
-                    max_worker_count=1,
+                    max_worker_count=max_worker_count,
                     role_arn=bootstrap.worker_role_arn,
                 )
             )
