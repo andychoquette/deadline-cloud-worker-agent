@@ -2,7 +2,11 @@ backoff == 2.2.*
 boto3 >= 1.34.75
 deadline >= 0.60.3, < 0.61
 deadline-job-attachments >= 0.1.1, < 0.1.4
-deadline-cloud-test-fixtures >= 0.18.21, < 0.19
+# TEMPORARY: replaces `deadline-cloud-test-fixtures >= 0.18.21, < 0.19` while the macOS
+# worker fixes land upstream. Revert to the released pin before merging. A direct URL
+# reference cannot coexist with a version specifier for the same package, so the pinned
+# line is replaced rather than supplemented.
+deadline-cloud-test-fixtures @ git+https://github.com/andychoquette/deadline-cloud-test-fixtures.git@fix-localmacworker-ordering
 flaky == 3.8.*
 mypy >= 2.3.0, < 2.4; python_version >= "3.10"
 mypy >= 1.19.1, < 1.20; python_version < "3.10"
