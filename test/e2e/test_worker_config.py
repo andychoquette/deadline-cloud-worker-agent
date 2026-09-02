@@ -11,6 +11,7 @@ import boto3
 import dataclasses
 import logging
 import os
+import pytest
 
 from deadline_test_fixtures import (
     DeadlineClient,
@@ -146,6 +147,14 @@ class TestWorkerConfiguration:
                     f"Checking that local session logs do not exist returned unexpected response: {check_log_exists_result}"
                 )
 
+    @pytest.mark.skipif(
+        os.environ["OPERATING_SYSTEM"] == "macos",
+        reason=(
+            "Needs a host that can be scaled out and powered off. The macOS worker runs on "
+            "the test host itself, so it has no instance_id, and shutting it down would take "
+            "the rest of the suite with it."
+        ),
+    )
     def test_worker_shuts_down_host_machine_if_configured(
         self,
         deadline_resources: DeadlineResources,

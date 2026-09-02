@@ -720,7 +720,7 @@ if __name__ == "__main__":
         )
 
     @pytest.mark.skipif(
-        os.environ["OPERATING_SYSTEM"] == "windows",
+        os.environ["OPERATING_SYSTEM"] != "linux",
         reason="Linux specific job bundle to test job attachments dependency data flow",
     )
     @pytest.mark.parametrize(
@@ -1813,7 +1813,7 @@ with open(output_path, "w") as f:
         )
 
     @pytest.mark.skipif(
-        os.environ["OPERATING_SYSTEM"] == "windows",
+        os.environ["OPERATING_SYSTEM"] != "linux",
         reason="Linux specific job bundle to test create job API call",
     )
     def test_worker_create_job_API_call_linux(

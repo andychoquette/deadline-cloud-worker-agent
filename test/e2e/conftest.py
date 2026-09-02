@@ -227,10 +227,37 @@ def _scaffold_deadline_resources(
         finally:
             resource.delete(client=deadline_client)
 
-    with ExitStack() as stack:
-        farm = stack.enter_context(
-            deletable(Farm.create(client=deadline_client, display_name="worker-agent-e2e-farm"))
+    _FARM_NAME = "worker-agent-e2e-farm"
+
+    def _report_leftover_farms() -> str:
+        """Name any farm this fixture appears to have leaked, for the quota error message.
+
+        A run that is killed rather than failed, such as a cancelled CI job, never unwinds
+        the ExitStack, so its farm survives. The farm quota is small enough that one
+        leftover makes every later run fail here, and CreateFarm's own message does not say
+        which farms are consuming the quota.
+        """
+        try:
+            farms = deadline_client.list_farms()["farms"]
+        except Exception:  # pragma: no cover - diagnostics only
+            return ""
+        leftovers = [f for f in farms if f.get("displayName") == _FARM_NAME]
+        if not leftovers:
+            return f" No farm named {_FARM_NAME} exists, so the quota is consumed elsewhere."
+        ids = ", ".join(f["farmId"] for f in leftovers)
+        return (
+            f" A farm named {_FARM_NAME} already exists ({ids}), which most likely leaked"
+            " from a run that was cancelled before it could clean up. Delete it and retry."
         )
+
+    with ExitStack() as stack:
+        try:
+            created_farm = Farm.create(client=deadline_client, display_name=_FARM_NAME)
+        except ClientError as e:
+            if e.response["Error"]["Code"] != "ServiceQuotaExceededException":
+                raise
+            raise RuntimeError(f"Could not create the e2e farm: {e}.{_report_leftover_farms()}")
+        farm = stack.enter_context(deletable(created_farm))
 
         def _queue(display_name: str, **kwargs) -> Queue:
             return stack.enter_context(
