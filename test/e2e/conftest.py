@@ -25,6 +25,7 @@ from deadline.client.config import set_setting as set_deadline_setting
 from deadline.job_attachments.download import get_s3_client, get_s3_transfer_manager
 from deadline_test_fixtures import (
     BootstrapResources,
+    CodeArtifactRepositoryInfo,
     DeadlineWorker,
     DeadlineWorkerConfiguration,
     DockerContainerWorker,
@@ -32,7 +33,6 @@ from deadline_test_fixtures import (
     Ec2Tag,
     Farm,
     Fleet,
-    JobRunAsUser,
     LocalMacWorker,
     OperatingSystem,
     PosixSessionUser,
@@ -40,8 +40,6 @@ from deadline_test_fixtures import (
     QueueFleetAssociation,
 )
 
-# Not re-exported from the package root, unlike the other model types.
-from deadline_test_fixtures.models import WindowsSessionUser
 
 LOG = logging.getLogger(__name__)
 
@@ -247,23 +245,47 @@ def _scaffold_deadline_resources(
                 )
             )
 
-        queue_a = _queue("e2e-queue-a", role_arn=bootstrap.session_role_arn)
-        queue_b = _queue("e2e-queue-b", role_arn=bootstrap.session_role_arn)
-        scaling_queue = _queue("e2e-scaling-queue", role_arn=bootstrap.session_role_arn)
+        # CreateQueueFleetAssociation rejects a queue with no jobRunAsUser, so every queue
+        # here sets one. Sent as the API shape rather than as a JobRunAsUser dataclass:
+        # Queue.create runs that through asdict(), which emits the windows member with an
+        # empty passwordArn instead of omitting it, failing client-side validation. The
+        # windows member is unnecessary here because these queues only associate with a
+        # macOS or Linux fleet.
+        job_user: PosixSessionUser = request.getfixturevalue("posix_job_user")
+        queue_configured_user = {
+            "jobRunAsUser": {
+                "runAs": "QUEUE_CONFIGURED_USER",
+                "posix": {"user": job_user.user, "group": job_user.group},
+            }
+        }
+
+        queue_a = _queue(
+            "e2e-queue-a",
+            role_arn=bootstrap.session_role_arn,
+            raw_kwargs=queue_configured_user,
+        )
+        queue_b = _queue(
+            "e2e-queue-b",
+            role_arn=bootstrap.session_role_arn,
+            raw_kwargs=queue_configured_user,
+        )
+        scaling_queue = _queue(
+            "e2e-scaling-queue",
+            role_arn=bootstrap.session_role_arn,
+            raw_kwargs=queue_configured_user,
+        )
         jobs_run_as_agent_user_queue = _queue(
             "e2e-jobs-run-as-agent-user-queue",
             role_arn=bootstrap.session_role_arn,
-            job_run_as_user=JobRunAsUser(
-                posix=PosixSessionUser("", ""),
-                runAs="WORKER_AGENT_USER",
-                windows=WindowsSessionUser("", ""),
-            ),
+            raw_kwargs={"jobRunAsUser": {"runAs": "WORKER_AGENT_USER"}},
         )
         # Deliberately given the worker role rather than the session role: its trust
         # policy does not admit queue-user credential vending, which is the failure
         # the tests using this queue assert on.
         non_valid_role_queue = _queue(
-            "e2e-non-valid-role-queue", role_arn=bootstrap.worker_role_arn
+            "e2e-non-valid-role-queue",
+            role_arn=bootstrap.worker_role_arn,
+            raw_kwargs=queue_configured_user,
         )
 
         fleet = stack.enter_context(
@@ -467,6 +489,32 @@ def test_runner_identity() -> dict[str, str]:
 
 
 @pytest.fixture(scope="session")
+def codeartifact(operating_system: OperatingSystem) -> CodeArtifactRepositoryInfo:
+    """Overrides the fixtures package's fixture, which requires four CODEARTIFACT_* vars.
+
+    `worker_config` depends on this unconditionally, so the variables are mandatory even
+    for a run that never reaches a CodeArtifact repository. EC2 and container workers do
+    need one, because they pip install the agent from a VPC with no route to PyPI. A
+    worker on a GitHub-hosted runner reaches PyPI directly and installs the agent from a
+    wheel built in the same job, so it needs no repository, and `worker_config` below
+    drops this from the install command rather than logging in to it.
+    """
+    if operating_system.is_macos() and "CODEARTIFACT_DOMAIN" not in os.environ:
+        return CodeArtifactRepositoryInfo(
+            region=os.getenv("REGION", "us-west-2"),
+            domain="unused",
+            domain_owner="unused",
+            repository="unused",
+        )
+    return CodeArtifactRepositoryInfo(
+        region=os.environ["CODEARTIFACT_REGION"],
+        domain=os.environ["CODEARTIFACT_DOMAIN"],
+        domain_owner=os.environ["CODEARTIFACT_ACCOUNT_ID"],
+        repository=os.environ["CODEARTIFACT_REPOSITORY"],
+    )
+
+
+@pytest.fixture(scope="session")
 def worker_config(
     posix_job_user: PosixSessionUser,
     posix_env_override_job_user: PosixSessionUser,
@@ -474,6 +522,7 @@ def worker_config(
     worker_config: DeadlineWorkerConfiguration,
     windows_job_users: list[str],
     session_runtime_option: Optional[str],
+    operating_system: OperatingSystem,
 ) -> DeadlineWorkerConfiguration:
     """
     Builds the configuration for a DeadlineWorker.
@@ -495,6 +544,13 @@ def worker_config(
         DeadlineWorkerConfiguration: Configuration for use by DeadlineWorker.
     """
 
+    worker_agent_install = worker_config.worker_agent_install
+    if operating_system.is_macos() and "CODEARTIFACT_DOMAIN" not in os.environ:
+        # Without this the install command begins with `aws codeartifact login`, which
+        # fails against the placeholder repository the fixture above returns. The agent
+        # comes from a locally built wheel and its dependencies from PyPI.
+        worker_agent_install = dataclasses.replace(worker_agent_install, codeartifact=None)
+
     return dataclasses.replace(
         worker_config,
         job_users=[
@@ -506,6 +562,7 @@ def worker_config(
         # TODO: Temporary workaround due to AWS CLI v2 upgrade causing canary failures when copying over AWS models for deadline
         service_model_path=None,
         session_runtime=session_runtime_option,
+        worker_agent_install=worker_agent_install,
     )
 
 
