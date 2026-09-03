@@ -208,6 +208,45 @@ class TestRun:
         assert raise_ctx.value is service_shutdown
         logger_exception.assert_not_called()
 
+    @pytest.mark.parametrize(
+        "timeout_exception_cls",
+        [
+            pytest.param(worker_mod.requests.ConnectTimeout, id="ConnectTimeout"),
+            pytest.param(worker_mod.requests.ReadTimeout, id="ReadTimeout"),
+        ],
+    )
+    def test_completes_when_startup_imds_probe_times_out(
+        self,
+        worker: Worker,
+        thread_pool_executor: MagicMock,
+        mock_logger: MagicMock,
+        requests_put: MagicMock,
+        timeout_exception_cls: type[Exception],
+    ) -> None:
+        """Tests that run() still returns when the IMDS probe it makes on startup times out.
+
+        run() makes that probe on the calling thread, before the wait() that the shutdown path
+        returns through. If the probe does not complete then the caller never gets to report status
+        STOPPED to the service, so the Worker is left in IDLE until the service manager escalates
+        to SIGKILL.
+        """
+
+        # GIVEN
+        requests_put.side_effect = timeout_exception_cls("Timed out")
+        scheduler_future = MagicMock()
+        thread_pool_executor.submit.return_value = scheduler_future
+        with (
+            patch.object(worker_mod, "wait", return_value=([scheduler_future], [])),
+            patch.object(worker_mod, "AwsCredentialsRefresher"),
+        ):
+            # WHEN
+            worker.run()
+
+        # THEN
+        # No EC2 shutdown monitor is started, since we could not determine that we are on EC2.
+        thread_pool_executor.submit.assert_called_once_with(worker._scheduler.run)
+        mock_logger.info.assert_any_call("Worker shutdown complete")
+
 
 class TestMonitorEc2Shutdown:
     @pytest.fixture
@@ -406,11 +445,39 @@ class TestEC2MetadataQueries:
         requests_put.assert_called_once_with(
             "http://169.254.169.254/latest/api/token",
             headers={"X-aws-ec2-metadata-token-ttl-seconds": "10"},
+            timeout=Worker._IMDS_REQUEST_TIMEOUT_S,
         )
 
     def test_get_imdsv2_token_cannot_connect(self, worker: Worker, requests_put: MagicMock) -> None:
         # GIVEN
         requests_put.side_effect = worker_mod.requests.ConnectionError("Error")
+
+        # WHEN
+        result = worker._get_ec2_metadata_imdsv2_token()
+
+        # THEN
+        assert result is None
+
+    @pytest.mark.parametrize(
+        "timeout_exception_cls",
+        [
+            pytest.param(worker_mod.requests.ConnectTimeout, id="ConnectTimeout"),
+            pytest.param(worker_mod.requests.ReadTimeout, id="ReadTimeout"),
+        ],
+    )
+    def test_get_imdsv2_token_times_out(
+        self,
+        worker: Worker,
+        requests_put: MagicMock,
+        timeout_exception_cls: type[Exception],
+    ) -> None:
+        """A timed-out IMDS token request must be treated as "not on EC2" rather than propagating.
+
+        requests.ReadTimeout is not a subclass of requests.ConnectionError, so it would otherwise
+        escape Worker.run() and abort the agent instead of letting it shut down cleanly.
+        """
+        # GIVEN
+        requests_put.side_effect = timeout_exception_cls("Timed out")
 
         # WHEN
         result = worker._get_ec2_metadata_imdsv2_token()
@@ -463,6 +530,7 @@ class TestEC2MetadataQueries:
         requests_get.assert_called_once_with(
             "http://169.254.169.254/latest/meta-data/spot/instance-action",
             headers={"X-aws-ec2-metadata-token": fake_token},
+            timeout=Worker._IMDS_REQUEST_TIMEOUT_S,
         )
         if not is_interrupt:
             assert result is None
@@ -575,6 +643,7 @@ class TestEC2MetadataQueries:
         requests_get.assert_called_once_with(
             "http://169.254.169.254/latest/meta-data/autoscaling/target-lifecycle-state",
             headers={"X-aws-ec2-metadata-token": fake_token},
+            timeout=Worker._IMDS_REQUEST_TIMEOUT_S,
         )
 
     def test_asg_terminate_cannot_connect(self, worker: Worker, requests_get: MagicMock) -> None:
@@ -586,6 +655,32 @@ class TestEC2MetadataQueries:
 
         # THEN
         assert not result
+
+    @pytest.mark.parametrize(
+        "timeout_exception_cls",
+        [
+            pytest.param(worker_mod.requests.ConnectTimeout, id="ConnectTimeout"),
+            pytest.param(worker_mod.requests.ReadTimeout, id="ReadTimeout"),
+        ],
+    )
+    def test_imds_metadata_queries_time_out(
+        self,
+        worker: Worker,
+        requests_get: MagicMock,
+        timeout_exception_cls: type[Exception],
+    ) -> None:
+        """A timed-out IMDS metadata request must report "no shutdown pending" rather than
+        propagating out of the EC2 shutdown monitoring thread."""
+        # GIVEN
+        requests_get.side_effect = timeout_exception_cls("Timed out")
+
+        # WHEN
+        spot_result = worker._get_spot_instance_shutdown_action_timeout(imdsv2_token="token")
+        asg_result = worker._is_asg_terminated(imdsv2_token="token")
+
+        # THEN
+        assert spot_result is None
+        assert asg_result is False
 
     def test_asg_terminate_imds_inactive(self, worker: Worker, requests_get: MagicMock) -> None:
         # GIVEN
