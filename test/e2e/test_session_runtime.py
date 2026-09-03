@@ -48,7 +48,7 @@ Worker openjd package location (for making the Rust adapter unloadable):
     fault-injection step in TestRustUnavailableAndRecovery)
 """
 
-from typing import Generator
+from typing import Generator, Union
 
 import backoff
 import dataclasses
@@ -63,6 +63,7 @@ from deadline_test_fixtures import (
     DeadlineWorker,
     DeadlineWorkerConfiguration,
     EC2InstanceWorker,
+    LocalMacWorker,
     TaskStatus,
 )
 
@@ -76,6 +77,11 @@ from e2e.utils import (
 LOG = logging.getLogger(__name__)
 
 # Agent log paths per OS
+# This module drives the agent's service directly, which the DeadlineWorker base
+# class does not declare. Both concrete workers that can host a macOS or Linux
+# agent expose it, so accept either rather than requiring the EC2 one.
+ServiceControllableWorker = Union[EC2InstanceWorker, LocalMacWorker]
+
 _LINUX_AGENT_LOG = "/var/log/amazon/deadline/worker-agent.log"
 _WINDOWS_AGENT_LOG = r"C:\ProgramData\Amazon\Deadline\Logs\worker-agent.log"
 
@@ -111,13 +117,13 @@ def _running_on_windows() -> bool:
     return os.environ["OPERATING_SYSTEM"].lower() == "windows"
 
 
-def _agent_log_path(worker: EC2InstanceWorker) -> str:
+def _agent_log_path(worker: ServiceControllableWorker) -> str:
     """Return the agent log path appropriate for the worker's OS."""
     return _WINDOWS_AGENT_LOG if _running_on_windows() else _LINUX_AGENT_LOG
 
 
 def _assert_log_contains(
-    worker: EC2InstanceWorker,
+    worker: ServiceControllableWorker,
     pattern: str,
     description: str,
 ) -> None:
@@ -171,7 +177,7 @@ def _assert_log_contains(
 def explicit_runtime_worker(
     request: pytest.FixtureRequest,
     worker_config: DeadlineWorkerConfiguration,
-) -> Generator[tuple[EC2InstanceWorker, str], None, None]:
+) -> Generator[tuple[ServiceControllableWorker, str], None, None]:
     """Create a worker with session_runtime set to the parametrized value.
 
     Two values: python and rust. Both run unconditionally; the Rust
@@ -185,7 +191,7 @@ def explicit_runtime_worker(
         dataclasses.replace(worker_config, session_runtime=runtime),
         request,
     ) as worker:
-        assert isinstance(worker, EC2InstanceWorker)
+        assert isinstance(worker, (EC2InstanceWorker, LocalMacWorker))
         yield worker, runtime
     stop_worker(request, worker)
 
@@ -204,7 +210,7 @@ class TestExplicitModeRouting:
         self,
         deadline_resources: DeadlineResources,
         deadline_client: DeadlineClient,
-        explicit_runtime_worker: tuple[EC2InstanceWorker, str],
+        explicit_runtime_worker: tuple[ServiceControllableWorker, str],
     ) -> None:
         worker, runtime = explicit_runtime_worker
         job = submit_sleep_job(
@@ -234,7 +240,7 @@ def service_selected_worker(
         dataclasses.replace(worker_config, session_runtime="service-selected"),
         request,
     ) as worker:
-        assert isinstance(worker, EC2InstanceWorker)
+        assert isinstance(worker, (EC2InstanceWorker, LocalMacWorker))
         yield worker
     stop_worker(request, worker)
 
@@ -255,7 +261,7 @@ class TestServiceSelectedDefaultsToPython:
         self,
         deadline_resources: DeadlineResources,
         deadline_client: DeadlineClient,
-        service_selected_worker: EC2InstanceWorker,
+        service_selected_worker: ServiceControllableWorker,
     ) -> None:
         job = submit_sleep_job(
             "session_runtime=service-selected (no hint) routing test",
@@ -293,7 +299,7 @@ class TestServiceSelectedWithRustHint:
         self,
         deadline_resources: DeadlineResources,
         deadline_client: DeadlineClient,
-        service_selected_worker: EC2InstanceWorker,
+        service_selected_worker: ServiceControllableWorker,
     ) -> None:
         job = submit_sleep_job(
             "session_runtime=service-selected (hint=rust) routing test",
@@ -336,7 +342,7 @@ class TestServiceSelectedWithPythonexprHint:
         self,
         deadline_resources: DeadlineResources,
         deadline_client: DeadlineClient,
-        service_selected_worker: EC2InstanceWorker,
+        service_selected_worker: ServiceControllableWorker,
     ) -> None:
         job = submit_sleep_job(
             "session_runtime=service-selected (hint=pythonexpr) routing test",
@@ -365,7 +371,7 @@ def rust_unavailable_worker(
         dataclasses.replace(worker_config, session_runtime="rust"),
         request,
     ) as worker:
-        assert isinstance(worker, EC2InstanceWorker)
+        assert isinstance(worker, (EC2InstanceWorker, LocalMacWorker))
         yield worker
     stop_worker(request, worker)
 
@@ -384,7 +390,7 @@ class TestRustUnavailableAndRecovery:
         self,
         deadline_resources: DeadlineResources,
         deadline_client: DeadlineClient,
-        rust_unavailable_worker: EC2InstanceWorker,
+        rust_unavailable_worker: ServiceControllableWorker,
     ) -> None:
         """Rust mode fails visibly when the adapter cannot load, then recovers after
         switching to python via worker.toml edit + service restart."""
