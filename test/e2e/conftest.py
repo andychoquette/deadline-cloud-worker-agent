@@ -341,7 +341,15 @@ def _scaffold_deadline_resources(
         queue_a = _queue(
             "e2e-queue-a",
             role_arn=bootstrap.session_role_arn,
-            raw_kwargs=queue_configured_user,
+            raw_kwargs={
+                **queue_configured_user,
+                # Allowing the storage profiles is not enough to get path mapping: the
+                # queue has to require the file system location by name before the service
+                # emits pathMappingRules for it, and without them the agent silently
+                # remaps job attachment roots into the session directory instead. Set on
+                # this queue alone, matching MainQueue in the CloudFormation scaffolding.
+                "requiredFileSystemLocationNames": ["StorageProfileTest"],
+            },
         )
         queue_b = _queue(
             "e2e-queue-b",
