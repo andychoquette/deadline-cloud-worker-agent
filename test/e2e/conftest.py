@@ -187,9 +187,17 @@ def _scaffold_deadline_resources(
     )
     cpu_architecture = "arm64" if operating_system.is_macos() else "x86_64"
 
-    def _storage_profile(display_name: str, family: str) -> str:
+    def _storage_profile(display_name: str, family: str, path: str) -> str:
+        # The path mapping under test works by giving the job's profile and the fleet's
+        # profile a location with the SAME name and different paths; the agent then
+        # rewrites one to the other. A profile with no fileSystemLocations makes the
+        # test that reads them fail on a missing key, so mirror the shape the
+        # CloudFormation scaffolding in scripts/e2e_testing_infrastructure.yaml uses.
         response = deadline_client.create_storage_profile(
-            farmId=farm.id, displayName=display_name, osFamily=family
+            farmId=farm.id,
+            displayName=display_name,
+            osFamily=family,
+            fileSystemLocations=[{"name": "StorageProfileTest", "path": path, "type": "LOCAL"}],
         )
         storage_profile_id = response["storageProfileId"]
         # Storage profiles are not modelled by deadline-cloud-test-fixtures, so
@@ -361,13 +369,25 @@ def _scaffold_deadline_resources(
                 )
             )
 
-        # Four storage profile IDs are required. The windows-named pair keeps that
-        # family regardless of the run's platform, since the tests that read them
-        # exercise cross-platform path mapping.
-        run_storage_profile = _storage_profile(
-            f"e2e-{os_family.lower()}-storage-profile", os_family
+        # Four distinct storage profiles: a job/fleet pair for this run's platform and a
+        # job/fleet pair for Windows, which keeps that family regardless of the run's
+        # platform because the tests that read them exercise cross-platform path mapping.
+        # The job and fleet halves of a pair must be separate profiles with different
+        # paths, otherwise the mapping they are meant to prove is the identity.
+        run_job_storage_profile = _storage_profile(
+            f"e2e-{os_family.lower()}-job-storage-profile", os_family, "/tmp/storageprofiletest"
         )
-        windows_storage_profile = _storage_profile("e2e-windows-storage-profile", "WINDOWS")
+        run_fleet_storage_profile = _storage_profile(
+            f"e2e-{os_family.lower()}-fleet-storage-profile",
+            os_family,
+            "/tmp/storageprofiletest/dest",
+        )
+        windows_job_storage_profile = _storage_profile(
+            "e2e-windows-job-storage-profile", "WINDOWS", "C:\\Users\\Public\\submission"
+        )
+        windows_fleet_storage_profile = _storage_profile(
+            "e2e-windows-fleet-storage-profile", "WINDOWS", "C:\\Users\\Public\\worker"
+        )
 
         LOG.info(
             f"Created Deadline resources - Farm ID: {farm.id}, Fleet ID: {fleet.id}, "
@@ -383,10 +403,10 @@ def _scaffold_deadline_resources(
             fleet_id=fleet.id,
             scaling_queue_id=scaling_queue.id,
             scaling_fleet_id=scaling_fleet.id,
-            job_storage_profile_id=run_storage_profile,
-            windows_job_storage_profile_id=windows_storage_profile,
-            fleet_storage_profile_id=run_storage_profile,
-            windows_fleet_storage_profile_id=windows_storage_profile,
+            job_storage_profile_id=run_job_storage_profile,
+            windows_job_storage_profile_id=windows_job_storage_profile,
+            fleet_storage_profile_id=run_fleet_storage_profile,
+            windows_fleet_storage_profile_id=windows_fleet_storage_profile,
         )
 
 

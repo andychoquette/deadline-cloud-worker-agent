@@ -225,9 +225,13 @@ class TestWorkerConfiguration:
         session_root_dir: str
         run_script: str
 
-        if operating_system.is_amazon_linux():
-            session_root_dir = "/mysessionroot"
-            run_script = f"""#!/usr/bin/bash
+        if operating_system.is_amazon_linux() or operating_system.is_macos():
+            # macOS cannot take the Linux path: the system volume is sealed and read-only,
+            # so a root-level /mysessionroot cannot be created.
+            session_root_dir = (
+                "/tmp/mysessionroot" if operating_system.is_macos() else "/mysessionroot"
+            )
+            run_script = f"""#!/usr/bin/env bash
 set -euo pipefail
 echo "=== Session Root Dir Test ==="
 echo "Expected: working dir under {session_root_dir}/"
