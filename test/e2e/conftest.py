@@ -273,13 +273,21 @@ def _scaffold_deadline_resources(
         # pair for Windows, which keeps that family regardless of the run's platform
         # because the tests reading them exercise cross-platform path mapping. The job
         # and fleet halves must differ, or the mapping they prove is the identity.
+        # /private/tmp on macOS, where /tmp is a symlink to it: paths the agent resolves
+        # come back physical, and a location recorded under the symlink then fails to
+        # match. The same substitution is what made the session_root_dir test pass.
+        storage_profile_root = (
+            "/private/tmp/storageprofiletest"
+            if operating_system.is_macos()
+            else "/tmp/storageprofiletest"
+        )
         run_job_storage_profile = _storage_profile(
-            f"e2e-{os_family.lower()}-job-storage-profile", os_family, "/tmp/storageprofiletest"
+            f"e2e-{os_family.lower()}-job-storage-profile", os_family, storage_profile_root
         )
         run_fleet_storage_profile = _storage_profile(
             f"e2e-{os_family.lower()}-fleet-storage-profile",
             os_family,
-            "/tmp/storageprofiletest/dest",
+            f"{storage_profile_root}/dest",
         )
         windows_job_storage_profile = _storage_profile(
             "e2e-windows-job-storage-profile", "WINDOWS", "C:\\Users\\Public\\submission"
