@@ -267,6 +267,33 @@ def _scaffold_deadline_resources(
             raise RuntimeError(f"Could not create the e2e farm: {e}.{_report_leftover_farms()}")
         farm = stack.enter_context(deletable(created_farm))
 
+        # Created before the queues, which must allowlist them: a queue rejects a job
+        # carrying a storage profile absent from its allowedStorageProfileIds. Four
+        # distinct profiles, a job/fleet pair for this run's platform plus a job/fleet
+        # pair for Windows, which keeps that family regardless of the run's platform
+        # because the tests reading them exercise cross-platform path mapping. The job
+        # and fleet halves must differ, or the mapping they prove is the identity.
+        run_job_storage_profile = _storage_profile(
+            f"e2e-{os_family.lower()}-job-storage-profile", os_family, "/tmp/storageprofiletest"
+        )
+        run_fleet_storage_profile = _storage_profile(
+            f"e2e-{os_family.lower()}-fleet-storage-profile",
+            os_family,
+            "/tmp/storageprofiletest/dest",
+        )
+        windows_job_storage_profile = _storage_profile(
+            "e2e-windows-job-storage-profile", "WINDOWS", "C:\\Users\\Public\\submission"
+        )
+        windows_fleet_storage_profile = _storage_profile(
+            "e2e-windows-fleet-storage-profile", "WINDOWS", "C:\\Users\\Public\\worker"
+        )
+        all_storage_profile_ids = [
+            run_job_storage_profile,
+            run_fleet_storage_profile,
+            windows_job_storage_profile,
+            windows_fleet_storage_profile,
+        ]
+
         def _queue(display_name: str, **kwargs) -> Queue:
             return stack.enter_context(
                 deletable(
@@ -275,6 +302,10 @@ def _scaffold_deadline_resources(
                         display_name=display_name,
                         farm=farm,
                         job_attachments=bootstrap.job_attachments,
+                        raw_kwargs={
+                            **kwargs.pop("raw_kwargs", {}),
+                            "allowedStorageProfileIds": all_storage_profile_ids,
+                        },
                         **kwargs,
                     )
                 )
@@ -368,26 +399,6 @@ def _scaffold_deadline_resources(
                     )
                 )
             )
-
-        # Four distinct storage profiles: a job/fleet pair for this run's platform and a
-        # job/fleet pair for Windows, which keeps that family regardless of the run's
-        # platform because the tests that read them exercise cross-platform path mapping.
-        # The job and fleet halves of a pair must be separate profiles with different
-        # paths, otherwise the mapping they are meant to prove is the identity.
-        run_job_storage_profile = _storage_profile(
-            f"e2e-{os_family.lower()}-job-storage-profile", os_family, "/tmp/storageprofiletest"
-        )
-        run_fleet_storage_profile = _storage_profile(
-            f"e2e-{os_family.lower()}-fleet-storage-profile",
-            os_family,
-            "/tmp/storageprofiletest/dest",
-        )
-        windows_job_storage_profile = _storage_profile(
-            "e2e-windows-job-storage-profile", "WINDOWS", "C:\\Users\\Public\\submission"
-        )
-        windows_fleet_storage_profile = _storage_profile(
-            "e2e-windows-fleet-storage-profile", "WINDOWS", "C:\\Users\\Public\\worker"
-        )
 
         LOG.info(
             f"Created Deadline resources - Farm ID: {farm.id}, Fleet ID: {fleet.id}, "

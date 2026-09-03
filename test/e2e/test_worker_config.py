@@ -227,9 +227,11 @@ class TestWorkerConfiguration:
 
         if operating_system.is_amazon_linux() or operating_system.is_macos():
             # macOS cannot take the Linux path: the system volume is sealed and read-only,
-            # so a root-level /mysessionroot cannot be created.
+            # so a root-level /mysessionroot cannot be created. /private/tmp rather than
+            # /tmp because /tmp is a symlink to it, and the agent reports the resolved
+            # path, which would not match a prefix check written against the symlink.
             session_root_dir = (
-                "/tmp/mysessionroot" if operating_system.is_macos() else "/mysessionroot"
+                "/private/tmp/mysessionroot" if operating_system.is_macos() else "/mysessionroot"
             )
             run_script = f"""#!/usr/bin/env bash
 set -euo pipefail

@@ -484,8 +484,12 @@ class TestRustUnavailableAndRecovery:
                 f"-Pattern '^session_runtime = .python.$' -Quiet)) {{ exit 1 }}"
             )
         else:
+            # -i.bak rather than a bare -i: BSD sed, which macOS ships, requires an
+            # argument to -i and would otherwise take the script as the backup suffix.
+            # The suffixed form is accepted by both BSD and GNU sed.
             switch_cmd = (
-                f"sed -i 's/^session_runtime = .*/session_runtime = \"python\"/' {toml_path}"
+                f"sed -i.bak 's/^session_runtime = .*/session_runtime = \"python\"/' {toml_path}"
+                f" && rm -f {toml_path}.bak"
                 f" && grep -q '^session_runtime = .python.$' {toml_path}"
             )
 
