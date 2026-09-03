@@ -210,21 +210,26 @@ def _scaffold_deadline_resources(
         )
         return storage_profile_id
 
-    def _fleet_configuration(mode: str) -> dict:
-        return {
-            "customerManaged": {
-                "mode": mode,
-                "workerCapabilities": {
-                    "vCpuCount": {"min": 1},
-                    "memoryMiB": {"min": 1024},
-                    # The API models osFamily as WINDOWS | LINUX | MACOS. botocore does
-                    # not validate enums client-side, so a wrong casing fails at the
-                    # service rather than locally.
-                    "osFamily": os_family,
-                    "cpuArchitectureType": cpu_architecture,
-                },
-            }
+    def _fleet_configuration(mode: str, storage_profile_id: str | None = None) -> dict:
+        customer_managed: dict = {
+            "mode": mode,
+            "workerCapabilities": {
+                "vCpuCount": {"min": 1},
+                "memoryMiB": {"min": 1024},
+                # The API models osFamily as WINDOWS | LINUX | MACOS. botocore does
+                # not validate enums client-side, so a wrong casing fails at the
+                # service rather than locally.
+                "osFamily": os_family,
+                "cpuArchitectureType": cpu_architecture,
+            },
         }
+        if storage_profile_id:
+            # Without this the service sends the worker no path mapping rules, so the
+            # agent remaps job attachment roots into the session directory instead of the
+            # fleet's file system location, and the path mapping tests see no outputs at
+            # all. The CloudFormation scaffolding sets it on the non-scaling fleet only.
+            customer_managed["storageProfileId"] = storage_profile_id
+        return {"customerManaged": customer_managed}
 
     T = TypeVar("T", Farm, Fleet, Queue, QueueFleetAssociation)
 
@@ -374,7 +379,7 @@ def _scaffold_deadline_resources(
                     client=deadline_client,
                     display_name="e2e-fleet",
                     farm=farm,
-                    configuration=_fleet_configuration("NO_SCALING"),
+                    configuration=_fleet_configuration("NO_SCALING", run_fleet_storage_profile),
                     max_worker_count=max_worker_count,
                     role_arn=bootstrap.worker_role_arn,
                 )

@@ -263,6 +263,12 @@ if __name__ == "__main__":
             },
         )
         job.wait_until_complete(client=deadline_client)
+        # Asserted before the output check below: wait_until_complete treats FAILED as
+        # complete, so a job that failed yields an empty mapping and the test reports
+        # "expected exactly one output root, but got {}" with nothing about the cause.
+        assert job.task_run_status == TaskStatus.SUCCEEDED, job_failure_message(
+            job, deadline_client, deadline_resources.queue_a, deadline_resources
+        )
 
         output_root_to_file_mappings: dict[str, list[str]] = wait_for_job_output(
             job=job,
