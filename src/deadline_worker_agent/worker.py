@@ -62,6 +62,18 @@ class Worker:
     """The amount of time to allow the Worker to gracefully shutdown after detecting an auto-scaling
     life-cycle event."""
 
+    _IMDS_REQUEST_TIMEOUT_S = 1.0
+    """Timeout applied to every IMDS request.
+
+    IMDS is a link-local endpoint that answers in single-digit milliseconds when it is present, so a
+    one second bound is generous for hosts that are on EC2. It exists for the hosts that are not:
+    169.254.169.254 is typically black-holed rather than refused off EC2, so an unbounded request
+    blocks for the OS TCP connect timeout (75s on macOS, ~130s on Linux). The first of these
+    requests is issued from the thread that runs the Worker, ahead of the wait that the shutdown
+    path returns through, so an unbounded request there stops the Worker from ever reporting STOPPED
+    to the service after a SIGTERM/service stop and leaves it stuck in IDLE until the service
+    manager escalates to SIGKILL."""
+
     _farm_id: str
     _fleet_id: str
     _worker_id: str
@@ -394,9 +406,10 @@ class Worker:
             response = requests.put(
                 "http://169.254.169.254/latest/api/token",
                 headers={"X-aws-ec2-metadata-token-ttl-seconds": "10"},
+                timeout=Worker._IMDS_REQUEST_TIMEOUT_S,
             )
-        except requests.ConnectionError:
-            # Could not connect to the metadata service. Either it's not enabled or we're not
+        except (requests.ConnectionError, requests.Timeout):
+            # Could not reach the metadata service. Either it's not enabled or we're not
             # on an EC2 instance.
             return None
 
@@ -425,9 +438,10 @@ class Worker:
             response = requests.get(
                 "http://169.254.169.254/latest/meta-data/spot/instance-action",
                 headers={"X-aws-ec2-metadata-token": imdsv2_token},
+                timeout=Worker._IMDS_REQUEST_TIMEOUT_S,
             )
-        except requests.ConnectionError:
-            # Could not connect to the metadata service. Either it's inactive or we're not
+        except (requests.ConnectionError, requests.Timeout):
+            # Could not reach the metadata service. Either it's inactive or we're not
             # on an EC2 instance.
             return None
 
@@ -476,8 +490,9 @@ class Worker:
             response = requests.get(
                 "http://169.254.169.254/latest/meta-data/autoscaling/target-lifecycle-state",
                 headers={"X-aws-ec2-metadata-token": imdsv2_token},
+                timeout=Worker._IMDS_REQUEST_TIMEOUT_S,
             )
-        except requests.ConnectionError:
+        except (requests.ConnectionError, requests.Timeout):
             return False
 
         if response.status_code == 200:
