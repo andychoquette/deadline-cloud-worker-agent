@@ -9,6 +9,7 @@ import re
 import requests
 import sys
 import sysconfig
+import time
 
 from deadline_worker_agent.config.settings import (
     DEFAULT_MACOS_SESSION_ROOT_DIR,
@@ -30,17 +31,109 @@ INSTALLER_PATH = {
 }
 
 
+_IMDS_REQUEST_TIMEOUT = (1.0, None)
+"""Ceiling on the *connect* phase of an IMDS request during install.
+
+The metadata address is link-local, so where nothing answers it the connect waits on ARP
+rather than being refused. Unbounded, that stalls the installer with no output on every
+workstation install, which is the whole reason for this value.
+
+Read is deliberately left unbounded, matching bootstrap.IMDS_REQUEST_TIMEOUT and this
+function's behaviour before the connect bound existed. `None` from _get_ec2_region is fatal --
+`install()` prints an error and exits 1 -- and a user-data install runs during boot, when IMDS
+is slowest. A read ceiling would make a consistently-slow-but-present IMDS fail the install,
+and the retry does not cover it: three attempts at an N-second read tolerate an IMDS slower
+than N no better than one does. Waiting is the correct behaviour there."""
+
+_IMDS_ATTEMPTS = 3
+"""Attempts before giving up on detecting a region from IMDS.
+
+Retried because `None` here is fatal: `install()` prints an error and exits 1 when no
+--region was passed. Bounding the request without retrying it would turn a slow EC2 answer
+into a failed install, and user-data installs run during boot."""
+
+_IMDS_BACKOFF_S = 0.5
+"""Delay between region-detection attempts.
+
+A throttled IMDS answers immediately, so back-to-back retries would meet the same empty
+token bucket."""
+
+
+def _is_transient_status(status_code: int) -> bool:
+    """Whether an IMDS status may clear on its own.
+
+    5xx belongs here as much as 429 does, and for the same reason _IMDS_ATTEMPTS exists at
+    all: a user-data install runs during boot, which is when the metadata service is not yet
+    fully up and answers 500 or 503. Treating those as final would leave the retry covering
+    only the narrower half of the transient set it was added for.
+    """
+    return status_code == 429 or status_code >= 500
+
+
+class _ImdsTransientError(Exception):
+    """IMDS answered in a way another attempt may improve on.
+
+    Raised for a transient status per _is_transient_status, and for a 401 on the
+    availability-zone hop. Every other outcome is determinate -- IMDSv2 disabled, a hop limit
+    too low, an empty token, an empty or unparseable AZ, or a ConnectTimeout from a
+    black-holed address -- and retrying those only repeats the same message at the user.
+
+    Not raised for a slow read. The read half of _IMDS_REQUEST_TIMEOUT is unbounded, so a
+    present-but-slow IMDS is waited out rather than retried; there is no ReadTimeout to catch.
+    Anyone bounding that read later needs to add the clause as well, because the retry does not
+    already cover it.
+
+    Must be re-raised past the broad `except Exception` in _get_ec2_region_once, which would
+    otherwise convert a retryable case back into a determinate answer.
+    """
+
+
 def _get_ec2_region() -> Optional[str]:
     """
     Gets the AWS region if running on EC2 by querying IMDS.
     Returns None if region could not be detected.
+    """
+    for attempt in range(1, _IMDS_ATTEMPTS + 1):
+        try:
+            return _get_ec2_region_once()
+        except _ImdsTransientError as e:
+            print(f"Failed to detect AWS region: {e}")
+            if attempt < _IMDS_ATTEMPTS:
+                print(f"Retrying region detection ({attempt} of {_IMDS_ATTEMPTS} attempts used)")
+                time.sleep(_IMDS_BACKOFF_S)
+    return None
+
+
+def _get_ec2_region_once() -> Optional[str]:
+    """One attempt at reading the region from IMDS. See _get_ec2_region.
+
+    Returns None when the answer is determinate -- there is no region to be had, and another
+    attempt would say the same. Raises _ImdsTransientError for the cases a further attempt may
+    resolve; see that class for which those are.
     """
     try:
         # Create IMDSv2 token
         token_response = requests.put(
             url="http://169.254.169.254/latest/api/token",
             headers={"X-aws-ec2-metadata-token-ttl-seconds": "10"},  # 10 second expiry
+            timeout=_IMDS_REQUEST_TIMEOUT,
         )
+        # Checked before the body is used. A 403 (IMDSv2 disabled) or 429 (throttled) has a
+        # non-empty error body, so `if not token` does not catch it -- that body would be
+        # sent as the token, IMDS would answer the next hop 401, and the user would be told
+        # the availability zone was unexpected while quoting an error page at them.
+        if _is_transient_status(token_response.status_code):
+            raise _ImdsTransientError(
+                f"IMDS returned HTTP {token_response.status_code} for the token request"
+            )
+        if token_response.status_code != 200:
+            print(
+                "AWS region could not be detected: IMDS returned HTTP "
+                f"{token_response.status_code} for an IMDSv2 token. IMDSv2 may be disabled, "
+                "or the hop limit may be too low to reach it from here."
+            )
+            return None
+
         token = token_response.text
         if not token:
             raise RuntimeError("Received empty IMDSv2 token")
@@ -49,8 +142,40 @@ def _get_ec2_region() -> Optional[str]:
         az_response = requests.get(
             url="http://169.254.169.254/latest/meta-data/placement/availability-zone",
             headers={"X-aws-ec2-metadata-token": token},
+            timeout=_IMDS_REQUEST_TIMEOUT,
         )
+        # Checked for the same reason as the token, since throttling is applied per request:
+        # this hop can be rejected after the token succeeded, and the 10s token TTL can also
+        # lapse between the two calls. Unchecked, that error body lands in `az`, fails the
+        # regex below, and reports "unexpected availability zone" with an error page in it --
+        # the outcome the token check exists to avoid, reached one hop later. A 429 also
+        # arrives as a body rather than an exception, so without this it would be determinate
+        # and skip the retry it deserves.
+        # 401 is transient on this hop only. It means the token was rejected, and the 10s TTL
+        # requested above can lapse between the two calls -- a fresh token on the next attempt
+        # is exactly the fix. A 401 on the token *request* would not be re-obtainable, which is
+        # why that branch does not include it.
+        if _is_transient_status(az_response.status_code) or az_response.status_code == 401:
+            raise _ImdsTransientError(
+                f"IMDS returned HTTP {az_response.status_code} for the availability zone"
+            )
+        if az_response.status_code != 200:
+            print(
+                "AWS region could not be detected: IMDS returned HTTP "
+                f"{az_response.status_code} for the availability zone."
+            )
+            return None
+
         az = az_response.text
+    except _ImdsTransientError:
+        # Raised above for a transient status. Re-raised rather than swallowed by the broad
+        # handler below, which would turn a retryable case into a determinate answer.
+        #
+        # No ReadTimeout clause: the read is unbounded, so a slow-but-present IMDS is waited
+        # out rather than retried. A ConnectTimeout -- the black-holed address on a
+        # workstation -- falls to the handler below and is determinate, which is right: no
+        # number of attempts will find a region there.
+        raise
     except Exception as e:
         print(f"Failed to detect AWS region: {e}")
         return None

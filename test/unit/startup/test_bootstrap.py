@@ -1014,6 +1014,48 @@ class TestEnforceNoInstanceProfile:
         )
         assert result is None
 
+    def test_a_connect_timeout_reads_as_not_on_ec2(
+        self,
+        mod_logger_mock: MagicMock,
+    ) -> None:
+        """A black-holed metadata address must not be reported as a slow IMDS.
+
+        ConnectTimeout subclasses both ConnectionError and Timeout, so a handler catching
+        Timeout would take this case and warn on every non-EC2 host at startup -- naming the
+        wrong cause, since IMDS was absent rather than slow.
+        """
+        # GIVEN
+        with patch.object(
+            bootstrap_mod.requests,
+            "put",
+            side_effect=bootstrap_mod.requests.ConnectTimeout("connect timed out"),
+        ):
+            # WHEN
+            result = bootstrap_mod._get_metadata("instance-id")
+
+        # THEN
+        assert result is None
+        mod_logger_mock.info.assert_called_once_with(
+            "Not running on EC2 or the metadata service was unable to be found!",
+        )
+        mod_logger_mock.warning.assert_not_called()
+
+    def test_the_read_phase_is_left_unbounded(
+        self,
+    ) -> None:
+        """Only the connect phase is bounded here, and that is load-bearing.
+
+        Every failure this function reports is a `None`, and on both of this file's call paths
+        a false `None` is worse than a slow answer: _enforce_no_instance_profile takes the
+        worker to STOPPED, and _get_instance_id silently disables the AMI-staleness check in
+        _load_or_create_worker, which then adopts the worker_id baked into the AMI. Boot is
+        both when IMDS is slowest and when these run, so waiting is correct.
+        """
+        connect, read = bootstrap_mod.IMDS_REQUEST_TIMEOUT
+
+        assert connect is not None, "the link-local connect must stay bounded"
+        assert read is None, "a read ceiling here would make a slow IMDS fail the worker"
+
     def test_imds_none_then_recovers(
         self,
         get_metadata_mock: MagicMock,

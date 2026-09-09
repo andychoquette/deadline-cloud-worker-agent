@@ -60,6 +60,30 @@ IMDS_RETRY_INITIAL_BACKOFF_SECONDS = 1.0
 IMDS_RETRY_BACKOFF_FACTOR = 2.0
 IMDS_RETRY_MAX_BACKOFF_SECONDS = 16.0
 
+# Ceiling on the *connect* phase of an IMDS request. An explicit (connect, read) pair because
+# `requests` applies a scalar to each phase separately, and read is deliberately left
+# unbounded, as it was before this value existed.
+#
+# Connect is the phase that needed bounding: the metadata address is link-local, so where
+# nothing answers it the connect waits on ARP instead of being refused, parking the caller.
+# 0.5s matches the value this file already used for the token request.
+#
+# Read stays unbounded because every way this function reports failure is a `None`, and on
+# this file's two call paths a false `None` is worse than a slow answer:
+#
+#   - _enforce_no_instance_profile treats it as IMDS being unreachable, and after the
+#     IMDS_RETRY_* budget takes the worker to STOPPED. A read ceiling would turn "IMDS is
+#     slow" into "the worker refuses to start".
+#   - _get_instance_id has no retry at all, and its `None` silently disables the AMI-staleness
+#     check in _load_or_create_worker -- which then adopts the worker_id baked into the AMI,
+#     the two-hosts-one-identity case that check exists to catch.
+#
+# An instance at boot with many concurrent metadata consumers is both when IMDS is slowest and
+# when these run. Bounding the read would trade a hang this file never had for two failure
+# modes it does not want, so only Worker._IMDS_REQUEST_TIMEOUT bounds both halves -- there a
+# false "not on EC2" costs spot-interruption monitoring and is already retried and logged.
+IMDS_REQUEST_TIMEOUT = (0.5, None)
+
 
 class WorkerDeregisteredError(Exception):
     """Exception raised when Worker is deregistered"""
@@ -727,13 +751,47 @@ def _get_metadata(metadata_type: str) -> requests.Response | None:
         response = requests.put(
             "http://169.254.169.254/latest/api/token",
             headers={"X-aws-ec2-metadata-token-ttl-seconds": "30"},
-            timeout=0.5,  # Non-aws worker hosts will time-out, but the default timeout can be > 20s
+            timeout=IMDS_REQUEST_TIMEOUT,
         )
+        # The token's status is deliberately not inspected, which leaves a pre-existing wart
+        # in place: a non-200 body is forwarded as the token, IMDS answers the next hop 401,
+        # and _enforce_no_instance_profile blames the instance profile ~120s later for a host
+        # whose profile state was never read.
+        #
+        # Two earlier revisions of this change tried to fix that here and both were worse.
+        # Returning None for any non-200 cuts the caller's tolerance from ~120s of polling,
+        # which recovers, to the 31s IMDS_RETRY_* budget, which stops the worker -- so a
+        # throttle burst at boot became fatal. Carving transient statuses out of that guard
+        # then did nothing at all: an IMDS error body is multi-line XHTML, requests rejects it
+        # as a header value with InvalidHeader, and the generic handler below returns None
+        # regardless while logging the wrong cause.
+        #
+        # Fixing it properly means teaching _enforce_no_instance_profile to tell "throttled"
+        # from "unreachable" so it can stay in its outer loop, which is a change to a security
+        # check's error taxonomy and belongs in its own review rather than in a change whose
+        # job is bounding these requests.
         token = response.text
+        # Bounded as well as the token request above. Both are in one try, so a host that
+        # black-holes the address short-circuits here on the token and never reaches this
+        # line -- but a partially-responsive IMDS answers the token and can then hang this
+        # hop, parking the caller. That matters because this feeds the instance-profile
+        # security check on the startup path.
         response = requests.get(
             f"http://169.254.169.254/latest/meta-data/{metadata_type}",
             headers={"X-aws-ec2-metadata-token": token},
+            timeout=IMDS_REQUEST_TIMEOUT,
         )
+        # This hop's status is deliberately left to the caller, unchanged from before.
+        #
+        # Throttling is per-request, so a host can answer the token 200 and then throttle
+        # here, which does reach the misdiagnosis the token guard above describes. Returning
+        # None would fix the message and cost more than it buys: 429 and 5xx are transient,
+        # and the caller already tolerates them for ~120s and recovers, where None caps that
+        # at 31s and then stops the worker.
+        #
+        # A permanent status has no equivalent here either, because the meaningful ones are
+        # already the caller's to read -- /iam/info answers 404 once the instance profile is
+        # disassociated, which is _enforce_no_instance_profile's success case.
     except Exception:
         _logger.info("Not running on EC2 or the metadata service was unable to be found!")
         return None
