@@ -162,14 +162,15 @@ jobs:
           ' >/dev/null 2>&1 &
           echo "watchdog armed"
 
-      # DIAGNOSTIC, revert to `hatch run e2e:test` once read. Narrowed to the one test
-      # that stops a running agent and waits for it to report STOPPED, so the loop is
-      # minutes rather than the better part of an hour. The sibling draining test is
-      # excluded on purpose: it stops the worker ~200ms after CreateJob, before the
-      # scheduler's 15s poll can give it a session, and the STOPPING transition it
-      # asserts is gated on there being one -- a separate problem from this.
+      # DIAGNOSTIC, revert to `hatch run e2e:test` once read. Narrowed to the two tests the
+      # IMDS probe stall breaks, so the loop is minutes rather than the better part of an
+      # hour. The draining test is included even though it was excluded from the earlier
+      # narrowing: its predicate accepts STOPPED as well as STOPPING, so an agent that
+      # completes shutdown satisfies it without needing a session to have been assigned.
       - name: Run E2E tests
-        run: hatch run e2e:test -k test_worker_lifecycle_status_is_expected
+        run: >-
+          hatch run e2e:test -k
+          "test_worker_lifecycle_status_is_expected or test_worker_enters_stopping_state_while_draining"
 
 
       # DIAGNOSTIC, remove with the above. The failure is in a test body rather than a
